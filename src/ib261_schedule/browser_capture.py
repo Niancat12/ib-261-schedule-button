@@ -99,8 +99,9 @@ def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]]
     except Exception: pass
     try:
         container = page.locator("#schedule-container")
-        meta = {"url": page.url, "title": page.title(), "selects": _select_metadata(page), "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:]}
-        (directory / "diagnostics.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        meta = {"url": page.url, "title": page.title(), "selects": _select_metadata(page), "page_text": page.locator("body").inner_text(timeout=1000) if page.locator("body").count() else "",
+            "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:]}
+        (directory / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception: pass
 
 
@@ -282,9 +283,32 @@ def capture_live(
 
                 checked_at = datetime.now(ZoneInfo("Europe/Moscow"))
                 return schedule, checked_at
+            except Exception:
+                if diagnostics_dir is not None and page is not None:
+                    _write_diagnostics(
+                        page, diagnostics_dir, responses=responses,
+                        console_errors=console_errors, page_errors=page_errors,
+                    )
+                raise
             finally:
                 browser.close()
-    except Exception:
-        if diagnostics_dir is not None and page is not None:
-            _write_diagnostics(page, diagnostics_dir, responses=responses, console_errors=console_errors, page_errors=page_errors)
+    except Exception as exc:
+        # Covers failures before a page exists (for example browser launch).
+        if diagnostics_dir is not None:
+            if page is not None:
+                _write_diagnostics(
+                    page, diagnostics_dir, responses=responses,
+                    console_errors=console_errors, page_errors=page_errors,
+                )
+            else:
+                diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                (diagnostics_dir / "metadata.json").write_text(
+                    json.dumps({
+                        "url": "", "title": "", "selects": [], "page_text": "",
+                        "schedule_text": "", "responses": responses[-100:],
+                        "console_errors": console_errors[-100:],
+                        "page_errors": page_errors[-100:],
+                        "error": type(exc).__name__,
+                    }, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
         raise

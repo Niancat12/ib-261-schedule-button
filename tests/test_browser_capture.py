@@ -108,3 +108,24 @@ def test_capture_live_selects_dependent_faculty_and_group(tmp_path: Path):
         server.shutdown(); thread.join()
     assert schedule.group == 'ИБ-261'
     assert schedule.lessons
+
+
+def test_capture_live_writes_diagnostics_when_group_selection_fails(tmp_path: Path, monkeypatch):
+    diagnostics = tmp_path / "diagnostics"
+    monkeypatch.setenv("SCHEDULE_DIAGNOSTIC_DIR", str(diagnostics))
+    monkeypatch.setattr(browser_capture, "_select_group", lambda *args: (_ for _ in ()).throw(browser_capture.ScheduleParseError("group missing")))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        try:
+            capture_live(date(2026, 9, 8), "ИБ-261", tmp_path / "schedule.png", url_builder=lambda *_: f"http://127.0.0.1:{server.server_port}/schedule")
+        except browser_capture.ScheduleParseError:
+            pass
+        else:
+            raise AssertionError("expected group selection failure")
+    finally:
+        server.shutdown(); thread.join()
+    assert (diagnostics / "page.png").is_file()
+    assert (diagnostics / "page.html").is_file()
+    metadata = (diagnostics / "metadata.json").read_text(encoding="utf-8")
+    assert '"url"' in metadata and '"selects"' in metadata

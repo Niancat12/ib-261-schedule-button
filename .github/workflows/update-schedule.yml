@@ -31,6 +31,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - run: uv run playwright install --with-deps chromium
+      - name: Prepare browser diagnostics
+        run: mkdir -p "$RUNNER_TEMP/ib261-diagnostics"
       - name: Fetch and publish verified snapshot
         env:
           REQUESTED_DATE: ${{ inputs.date }}
@@ -43,7 +45,7 @@ jobs:
         with:
           name: ib261-browser-diagnostics-${{ github.run_id }}
           path: ${{ runner.temp }}/ib261-diagnostics
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 14
       - name: Commit only changed verified publication
         run: |
