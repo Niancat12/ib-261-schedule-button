@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
@@ -19,6 +21,87 @@ _WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 class SourceUnavailable(RuntimeError):
     pass
+
+
+def _select_metadata(page) -> list[dict[str, Any]]:
+    return page.evaluate("""() => [...document.querySelectorAll('select')].map((el) => ({
+      id: el.id || '', name: el.name || '', value: el.value || '',
+      selectedText: el.selectedOptions?.[0]?.textContent?.trim() || '',
+      options: [...el.options].map((o) => ({value: o.value, text: o.textContent.trim()})).slice(0, 200)
+    }))""")
+
+
+def _select_group(page, group: str, timeout_ms: int) -> None:
+    """Select the dependent faculty/group controls and prove the UI accepted it."""
+    def find_group():
+        metadata = _select_metadata(page)
+        item = next((entry for entry in metadata if any(option.get("text", "").strip() == group for option in entry.get("options", []))), None)
+        if item is None:
+            return None
+        selector = f"select#{item['id']}" if item.get("id") else f"select[name='{item['name']}']"
+        return page.locator(selector).first
+
+    group_select = find_group()
+    if group_select is None:
+        # The group list is commonly populated after choosing a faculty/subdivision.
+        for item in _select_metadata(page):
+            selector = f"select#{item['id']}" if item.get("id") else (f"select[name='{item['name']}']" if item.get("name") else None)
+            if not selector:
+                continue
+            control = page.locator(selector).first
+            for option in item.get("options", [])[:50]:
+                value = option.get("value", "")
+                label = option.get("text", "").strip()
+                if not value or not label or label.casefold() in {"выберите", "выберите факультет", "все"}:
+                    continue
+                try:
+                    control.select_option(value, timeout=min(timeout_ms, 5000))
+                    control.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }")
+                    page.wait_for_timeout(250)
+                except Exception:
+                    continue
+                group_select = find_group()
+                if group_select is not None:
+                    break
+            if group_select is not None:
+                break
+    if group_select is None:
+        raise ScheduleParseError(f"Группа {group} отсутствует в интерфейсе источника")
+    current = group_select.locator("option:checked").inner_text().strip()
+    if current != group:
+        option = group_select.locator("option").filter(has_text=re.compile(rf"^{re.escape(group)}$"))
+        value = option.get_attribute("value")
+        if value is None:
+            raise ScheduleParseError(f"Группа {group} отсутствует в интерфейсе источника")
+        group_select.select_option(value, timeout=timeout_ms)
+    group_select.evaluate("el => { [...el.options].forEach(o => o.removeAttribute('selected')); el.selectedOptions[0]?.setAttribute('selected', 'selected'); el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }")
+    page.wait_for_function("expected => [...document.querySelectorAll('select option:checked')].some(o => o.textContent.trim() === expected)", arg=group, timeout=timeout_ms)
+
+
+def _wait_for_schedule_state(page, target: date, group: str, timeout_ms: int) -> None:
+    page.wait_for_function("""({target, group}) => {
+      const body = document.body?.innerText || '';
+      const container = document.querySelector('#schedule-container');
+      const selected = [...document.querySelectorAll('select option:checked')].some(o => o.textContent.trim() === group);
+      const prompt = /Выберете преподавателя или группу/i.test(body);
+      const content = container?.innerText || '';
+      const lesson = /\\b\\d{2}:\\d{2}\\s*[-–—]\\s*\\d{2}:\\d{2}\\b/.test(content);
+      const empty = /нет занятий|занятий нет/i.test(content);
+      return selected && !prompt && !!container && !!(container.offsetWidth || container.offsetHeight) && (lesson || empty) && body.includes(target);
+    }""", arg={"target": target.strftime("%d.%m.%Y"), "group": group}, timeout=timeout_ms)
+
+
+def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]], console_errors: list[str], page_errors: list[str]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    try: page.screenshot(path=str(directory / "page.png"), full_page=True)
+    except Exception: pass
+    try: (directory / "page.html").write_text(page.content(), encoding="utf-8")
+    except Exception: pass
+    try:
+        container = page.locator("#schedule-container")
+        meta = {"url": page.url, "title": page.title(), "selects": _select_metadata(page), "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:]}
+        (directory / "diagnostics.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception: pass
 
 
 def capture_live(
@@ -40,6 +123,12 @@ def capture_live(
     """
     url = url_builder(target, group)
     output.parent.mkdir(parents=True, exist_ok=True)
+    diagnostic_env = os.environ.get("SCHEDULE_DIAGNOSTIC_DIR", "").strip()
+    diagnostics_dir = Path(diagnostic_env) if diagnostic_env else None
+    page = None
+    responses: list[dict[str, Any]] = []
+    console_errors: list[str] = []
+    page_errors: list[str] = []
     try:
         with sync_playwright() as playwright:
             browser_options: dict[str, Any] = {}
@@ -54,11 +143,21 @@ def capture_live(
                     viewport={"width": 1400, "height": 1200},
                 )
                 page = context.new_page()
-                response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+                page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+                page.on("response", lambda response: responses.append({"url": response.url.split("?")[0], "status": response.status}) if response.request.resource_type in {"document", "xhr", "fetch"} else None)
+                try:
+                    response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except PlaywrightTimeoutError as exc:
+                    raise SourceUnavailable("Сетевой тайм-аут при открытии официального источника") from exc
                 if response is None or response.status != 200:
                     status = response.status if response is not None else "no-response"
                     raise SourceUnavailable(f"VGTU HTTP {status}")
-                page.wait_for_selector("#schedule-container", state="visible", timeout=timeout_ms)
+                _select_group(page, group, timeout_ms)
+                try:
+                    _wait_for_schedule_state(page, target, group, timeout_ms)
+                except PlaywrightTimeoutError as exc:
+                    raise SourceUnavailable("Интерфейс расписания не подтвердил выбор группы и даты") from exc
 
                 # STEP (A): Freeze document before any mutations
                 frozen = page.evaluate(
@@ -185,5 +284,7 @@ def capture_live(
                 return schedule, checked_at
             finally:
                 browser.close()
-    except PlaywrightTimeoutError as exc:
-        raise SourceUnavailable("Тайм-аут источника расписания") from exc
+    except Exception:
+        if diagnostics_dir is not None and page is not None:
+            _write_diagnostics(page, diagnostics_dir, responses=responses, console_errors=console_errors, page_errors=page_errors)
+        raise

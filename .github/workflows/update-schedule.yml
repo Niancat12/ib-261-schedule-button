@@ -35,7 +35,16 @@ jobs:
         env:
           REQUESTED_DATE: ${{ inputs.date }}
           TZ: Europe/Moscow
+          SCHEDULE_DIAGNOSTIC_DIR: ${{ runner.temp }}/ib261-diagnostics
         run: uv run python scripts/fetch_schedule.py
+      - name: Upload browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ib261-browser-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/ib261-diagnostics
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Commit only changed verified publication
         run: |
           if git diff --quiet -- published-schedules; then

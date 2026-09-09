@@ -82,3 +82,29 @@ def test_capture_live_parses_and_screenshots_the_same_dom(tmp_path: Path):
     assert [lesson.subject for lesson in schedule.lessons] == ["Физика", "История России"]
     assert checked_at.tzinfo is not None
     assert output.is_file() and output.stat().st_size > 1000
+
+
+def test_capture_live_selects_dependent_faculty_and_group(tmp_path: Path):
+    html = """<!doctype html><html><body>
+    <div id='todayDate'>Сегодня 08.09.2026, знаменатель</div>
+    <select id='faculty'><option value=''>Выберите факультет</option><option value='ib'>Институт</option></select>
+    <select id='gruppa'><option value=''>Выберите группу</option></select>
+    <p id='prompt'>Выберете преподавателя или группу</p>
+    <div id='schedule-container' style='display:none'><h2>Расписание на знаменатель</h2><table>
+    <tr><td><b>Вт.</b></td><td>08:30 - 10:05</td><td>430</td><td></td><td>Лабораторные занятия<br><b>Физика</b><br>Иванов</td></tr>
+    </table></div>
+    <script>document.querySelector('#faculty').onchange=()=>{document.querySelector('#gruppa').innerHTML='<option value="ib261">ИБ-261</option>'; document.querySelector('#gruppa').onchange=()=>{document.querySelector('#prompt').remove(); document.querySelector('#schedule-container').style.display='block';};};</script>
+    </body></html>"""
+    class DependentHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers(); self.wfile.write(html.encode())
+        def log_message(self, *args):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), DependentHandler)
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        schedule, _ = capture_live(date(2026, 9, 8), 'ИБ-261', tmp_path / 'schedule.png', url_builder=lambda *_: f'http://127.0.0.1:{server.server_port}/schedule')
+    finally:
+        server.shutdown(); thread.join()
+    assert schedule.group == 'ИБ-261'
+    assert schedule.lessons
