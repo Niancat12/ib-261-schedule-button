@@ -1,0 +1,49 @@
+name: Update IB-261 schedule
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Дата YYYY-MM-DD; пусто = сегодня по Europe/Moscow"
+        required: false
+        type: string
+  schedule:
+    - cron: "17 */3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ib261-schedule-publication
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SCHEDULE_PROXY_URL: ${{ secrets.SCHEDULE_PROXY_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: uv run playwright install --with-deps chromium
+      - name: Fetch and publish verified snapshot
+        env:
+          REQUESTED_DATE: ${{ inputs.date }}
+          TZ: Europe/Moscow
+        run: uv run python scripts/fetch_schedule.py
+      - name: Commit only changed verified publication
+        run: |
+          if git diff --quiet -- published-schedules; then
+            echo "No verified data change"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add published-schedules
+          git commit -m "chore: update verified IB-261 schedule"
+          git push

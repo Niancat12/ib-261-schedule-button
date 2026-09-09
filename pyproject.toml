@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ib261-schedule-button"
+version = "0.1.0"
+description = "Hermes Telegram plugin for the VGTU IB-261 schedule"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.28.1,<1",
+  "lxml>=6.0,<7",
+  "playwright>=1.55,<2",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ib261_schedule"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

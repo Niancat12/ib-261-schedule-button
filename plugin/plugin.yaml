@@ -1,0 +1,5 @@
+name: ib261-schedule
+version: 0.1.0
+description: Persistent Telegram keyboard and verified VGTU schedule delivery for IB-261
+provides_hooks:
+  - pre_gateway_dispatch
