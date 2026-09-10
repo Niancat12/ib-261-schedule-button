@@ -40,9 +40,9 @@ def test_capture_live_uses_one_weekly_snapshot_for_parse_and_screenshot(
     calls: list[str] = []
     real_parse = browser_capture.parse_schedule_html
 
-    def recording_parse(source_html, target, group):
+    def recording_parse(source_html, target, group, **kwargs):
         calls.append(source_html)
-        return real_parse(source_html, target, group)
+        return real_parse(source_html, target, group, **kwargs)
 
     monkeypatch.setattr(browser_capture, "parse_schedule_html", recording_parse)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

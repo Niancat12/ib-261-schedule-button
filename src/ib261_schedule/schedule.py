@@ -199,7 +199,13 @@ def _lesson_from_cells(cells: list) -> Lesson | None:
     )
 
 
-def _parse_week_tree(source_html: str, requested_date: date, group: str) -> tuple[dict[date, tuple[Lesson, ...]], set[date], str]:
+def _parse_week_tree(
+    source_html: str,
+    requested_date: date,
+    group: str,
+    *,
+    group_confirmed_by_url: bool = False,
+) -> tuple[dict[date, tuple[Lesson, ...]], set[date], str]:
     try:
         tree = html.fromstring(source_html)
     except (ValueError, TypeError) as exc:
@@ -216,7 +222,7 @@ def _parse_week_tree(source_html: str, requested_date: date, group: str) -> tupl
     selected_group = _selected_group(tree)
     if selected_group is not None and selected_group != group:
         raise ScheduleParseError("Источник не подтвердил выбранную группу")
-    if selected_group is None and not _group_option_exists(tree, group):
+    if selected_group is None and not group_confirmed_by_url and not _group_option_exists(tree, group):
         raise ScheduleParseError("Источник не содержит требуемую группу")
 
     monday = week_monday(requested_date)
@@ -253,13 +259,24 @@ def _parse_week_tree(source_html: str, requested_date: date, group: str) -> tupl
     return {key: tuple(value) for key, value in lessons_by_date.items()}, empty_days, _parity(tree)
 
 
-def parse_week_schedule_html(source_html: str, requested_date: date, group: str) -> dict[date, DaySchedule]:
+def parse_week_schedule_html(
+    source_html: str,
+    requested_date: date,
+    group: str,
+    *,
+    group_confirmed_by_url: bool = False,
+) -> dict[date, DaySchedule]:
     """Parse the complete official weekly table using the requested date as its anchor.
 
     The source returns Monday-through-Sunday regardless of the requested weekday.  The
     requested date therefore identifies the week, not the first row in the table.
     """
-    lessons_by_date, empty_days, parity = _parse_week_tree(source_html, requested_date, group)
+    lessons_by_date, empty_days, parity = _parse_week_tree(
+        source_html,
+        requested_date,
+        group,
+        group_confirmed_by_url=group_confirmed_by_url,
+    )
     monday = week_monday(requested_date)
     result: dict[date, DaySchedule] = {}
     for offset in range(7):
@@ -276,8 +293,19 @@ def parse_week_schedule_html(source_html: str, requested_date: date, group: str)
     return result
 
 
-def parse_schedule_html(source_html: str, requested_date: date, group: str) -> DaySchedule:
-    week = parse_week_schedule_html(source_html, requested_date, group)
+def parse_schedule_html(
+    source_html: str,
+    requested_date: date,
+    group: str,
+    *,
+    group_confirmed_by_url: bool = False,
+) -> DaySchedule:
+    week = parse_week_schedule_html(
+        source_html,
+        requested_date,
+        group,
+        group_confirmed_by_url=group_confirmed_by_url,
+    )
     schedule = week.get(requested_date)
     if schedule is None:
         raise ScheduleParseError("Источник не содержит выбранный день недели")

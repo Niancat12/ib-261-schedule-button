@@ -80,6 +80,64 @@ def _validate_canonical_url(
     return actual
 
 
+def _canonical_validation_metadata(
+    final_url: str,
+    requested_url: str,
+    target: date,
+    group: str,
+    parity: str,
+) -> dict[str, Any]:
+    """Validate and describe the canonical path without consulting JavaScript UI state."""
+    segments = _validate_canonical_url(final_url, requested_url, target, group, parity)
+    return {
+        "group_validation_method": "canonical_url_path",
+        "canonical_group": segments[-3],
+        "requested_group": group,
+        "canonical_date": segments[-2],
+        "requested_date": target.isoformat(),
+        "canonical_parity": segments[-1],
+        "expected_parity": parity,
+        "redirect_detected": final_url.rstrip("/") != requested_url.rstrip("/"),
+        "normalized_final_segments": segments,
+    }
+
+
+def _validate_canonical_snapshot_state(
+    state: dict[str, Any], target: date, group: str, parity: str
+) -> None:
+    """Validate only facts available in a JavaScript-disabled server snapshot."""
+    if state.get("promptPresent"):
+        raise SourceIntegrityError("Источник вернул приглашение выбрать преподавателя или группу")
+    if not state.get("dateHeaderMatches"):
+        raise SourceIntegrityError("Официальная страница не подтвердила запрошенную дату")
+    if not state.get("parityMatches"):
+        raise SourceIntegrityError("Официальная страница не подтвердила тип учебной недели")
+    if _looks_like_error_page(state.get("title", ""), state.get("pageText", "")):
+        raise SourceIntegrityError("Канонический URL вернул страницу ошибки")
+    if not state.get("headingPresent") or not state.get("tablePresent"):
+        raise SourceIntegrityError("Канонический URL не содержит заголовок и таблицу расписания")
+    if not state.get("hasContent"):
+        raise SourceIntegrityError("Источник не подтвердил занятия или официальное отсутствие занятий")
+
+
+def _validate_schedule_document(
+    state: dict[str, Any], fragment: dict[str, Any], week: dict[date, DaySchedule]
+) -> int:
+    """Validate structured schedule content independently from UI controls."""
+    if fragment.get("tableCount") != 1 or not fragment.get("tableHtml"):
+        raise SourceIntegrityError("Источник не содержит ровно одну таблицу расписания")
+    if not state.get("weekdays"):
+        raise SourceIntegrityError("Источник не содержит дней недельного расписания")
+    lesson_count = sum(len(day.lessons) for day in week.values())
+    if lesson_count == 0 and len(week) != 7:
+        raise SourceIntegrityError("Пустая неделя не подтверждена разделами всех семи дней")
+    if fragment.get("lessonNameCount", 0) and fragment["lessonNameCount"] != lesson_count:
+        raise SourceIntegrityError("Число lesson-name не совпадает с распознанными занятиями")
+    if fragment.get("lessonRows", 0) and fragment["lessonRows"] != lesson_count:
+        raise SourceIntegrityError("Число строк занятий не совпадает с распознанными занятиями")
+    return lesson_count
+
+
 def _looks_like_error_page(title: str, text: str) -> bool:
     sample = f"{title}\n{text[:4000]}".casefold()
     return any(marker in sample for marker in _ERROR_MARKERS)
@@ -657,27 +715,17 @@ def _capture_live_once(
                     raise SourceUnavailable(f"Канонический URL расписания вернул HTTP {status}")
                 if "text/html" not in content_type.casefold():
                     raise SourceIntegrityError("Канонический ответ не является HTML")
-                final_segments = _validate_canonical_url(page.url, canonical_url, target, group, parity)
-                capture_metadata["normalized_final_segments"] = final_segments
+                capture_metadata.update(
+                    _canonical_validation_metadata(page.url, canonical_url, target, group, parity)
+                )
 
                 state = _wait_for_canonical_state(page, target, group, parity, timeout_ms)
-                if not state.get("groupOptionExists"):
-                    raise SourceIntegrityError("Официальная страница не содержит option требуемой группы")
-                if not state.get("dateHeaderMatches"):
-                    raise SourceIntegrityError("Официальная страница не подтвердила запрошенную дату")
-                if not state.get("parityMatches"):
-                    raise SourceIntegrityError("Официальная страница не подтвердила тип учебной недели")
-                if state.get("promptPresent"):
-                    raise SourceIntegrityError("Источник вернул приглашение выбрать преподавателя или группу")
-                if _looks_like_error_page(state.get("title", ""), state.get("pageText", "")):
-                    raise SourceIntegrityError("Канонический URL вернул страницу ошибки")
-                if not state.get("headingPresent") or not state.get("tablePresent"):
-                    raise SourceIntegrityError("Канонический URL не содержит заголовок и таблицу расписания")
-                if not state.get("hasContent"):
-                    raise SourceIntegrityError("Источник не подтвердил занятия или официальное отсутствие занятий")
+                _validate_canonical_snapshot_state(state, target, group, parity)
                 capture_metadata.update({
                     "selected_group": state.get("selectedGroup", ""),
                     "selected_group_text": state.get("selectedText", ""),
+                    "group_option_exists": state.get("groupOptionExists", False),
+                    "group_option_validation": "advisory_only_javascript_disabled",
                     "date_header": state.get("todayDateText", ""),
                     "parity_text": state.get("parityText", ""),
                     "schedule_class": state.get("containerClass", ""),
@@ -690,8 +738,6 @@ def _capture_live_once(
                 # in this context, so this HTML is also the source for parsing.
                 fragment_before = _schedule_fragment(page)
                 table_html = fragment_before.get("tableHtml", "")
-                if not table_html or fragment_before.get("tableCount") != 1:
-                    raise SourceIntegrityError("Источник не содержит ровно одну таблицу расписания")
                 table_hash = _sha256_text(table_html)
                 frozen_html = page.content()
                 source_hash = _sha256_text(frozen_html)
@@ -709,25 +755,33 @@ def _capture_live_once(
                     "source_html_sha256": source_hash,
                 })
 
-                schedule = parse_schedule_html(frozen_html, target, group)
-                week = parse_week_schedule_html(frozen_html, target, group)
+                # The canonical URL is the authoritative group proof for the
+                # JavaScript-disabled snapshot.  Its catalog may legitimately
+                # contain only the "Все" option, so parsing must not require a
+                # client-populated group option in this strategy.
+                schedule = parse_schedule_html(
+                    frozen_html,
+                    target,
+                    group,
+                    group_confirmed_by_url=True,
+                )
+                week = parse_week_schedule_html(
+                    frozen_html,
+                    target,
+                    group,
+                    group_confirmed_by_url=True,
+                )
                 if week.get(target) != schedule:
                     raise SourceIntegrityError("Дневной и недельный разбор snapshot расходятся")
                 if schedule.parity != parity:
                     raise SourceIntegrityError("Распарсенная чётность не совпадает с canonical URL")
-                total_lessons = sum(len(day.lessons) for day in week.values())
-                if total_lessons == 0 and len(week) != 7:
-                    raise SourceIntegrityError(
-                        "Пустая неделя не подтверждена разделами всех семи дней"
-                    )
-                if fragment_before.get("lessonNameCount", 0) and fragment_before["lessonNameCount"] != total_lessons:
-                    raise SourceIntegrityError("Число lesson-name не совпадает с распознанными занятиями")
-                if fragment_before.get("lessonRows", 0) and fragment_before["lessonRows"] != total_lessons:
-                    raise SourceIntegrityError("Число строк занятий не совпадает с распознанными занятиями")
+                total_lessons = _validate_schedule_document(state, fragment_before, week)
                 capture_metadata.update({
                     "week_days": [day.isoformat() for day in sorted(week)],
                     "week_lesson_count": total_lessons,
                     "selected_day_lesson_count": len(schedule.lessons),
+                    "lesson_count": total_lessons,
+                    "schedule_table_valid": True,
                     "empty_confirmed": schedule.empty_confirmed,
                 })
 

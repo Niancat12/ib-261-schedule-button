@@ -26,7 +26,7 @@ def _weekly_html() -> str:
     </style></head><body>
       <div id='todayDate'>Сегодня 10.9.2026</div>
       <div id='weekParity'><button class='active'>знаменатель</button></div>
-      <select id='gruppa'><option value='ИБ-261'>ИБ-261</option><option value='ИБ-262'>ИБ-262</option></select>
+      <select id='gruppa'><option value=''>Все</option></select>
       <select id='prepodavatel'><option value=''>Выберите преподавателя</option></select>
       <div id='schedule-container'><h2>Расписание на знаменатель</h2><table>
         """ + "".join(rows) + """
@@ -89,7 +89,9 @@ def test_thursday_target_uses_monday_anchored_week_and_ignores_live_reset(tmp_pa
 
 def test_fixture_contains_all_21_lessons_and_calendar_week_dates():
     html = _weekly_html()
-    week = parse_week_schedule_html(html, date(2026, 9, 10), "ИБ-261")
+    week = parse_week_schedule_html(
+        html, date(2026, 9, 10), "ИБ-261", group_confirmed_by_url=True
+    )
     assert sum(len(day.lessons) for day in week.values()) == 21
     assert sorted(week) == [date(2026, 9, day) for day in range(7, 14)]
     assert week[date(2026, 9, 10)].lessons[0].subject == "Предмет 3-0"
@@ -97,5 +99,7 @@ def test_fixture_contains_all_21_lessons_and_calendar_week_dates():
 
 def test_week_parser_handles_month_and_year_boundaries():
     html = _weekly_html().replace("10.9.2026", "01.01.2027")
-    week = parse_week_schedule_html(html, date(2027, 1, 1), "ИБ-261")
+    week = parse_week_schedule_html(
+        html, date(2027, 1, 1), "ИБ-261", group_confirmed_by_url=True
+    )
     assert sorted(week) == [date(2026, 12, 28), date(2026, 12, 29), date(2026, 12, 30), date(2026, 12, 31), date(2027, 1, 1), date(2027, 1, 2), date(2027, 1, 3)]

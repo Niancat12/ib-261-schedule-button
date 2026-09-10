@@ -33,6 +33,38 @@ def test_validate_canonical_url_compares_decoded_path_segments():
             )
 
 
+def test_canonical_snapshot_uses_url_group_when_javascript_catalog_has_only_all():
+    state = {
+        "promptPresent": False,
+        "dateHeaderMatches": True,
+        "parityMatches": True,
+        "title": "Расписание",
+        "pageText": "Расписание на знаменатель",
+        "headingPresent": True,
+        "tablePresent": True,
+        "hasContent": True,
+        "groupOptionExists": False,
+    }
+    browser_capture._validate_canonical_snapshot_state(
+        state, date(2026, 9, 10), "ИБ-261", "знаменатель"
+    )
+
+
+def test_canonical_validation_metadata_is_structural_and_exact():
+    requested = (
+        "https://cchgeu.ru/studentu/onlayn-raspisanie/"
+        "%D0%98%D0%91-261/2026-09-10/%D0%B7%D0%BD%D0%B0%D0%BC%D0%B5%D0%BD%D0%B0%D1%82%D0%B5%D0%BB%D1%8C"
+    )
+    metadata = browser_capture._canonical_validation_metadata(
+        requested + "/", requested, date(2026, 9, 10), "ИБ-261", "знаменатель"
+    )
+    assert metadata["group_validation_method"] == "canonical_url_path"
+    assert metadata["canonical_group"] == "ИБ-261"
+    assert metadata["canonical_date"] == "2026-09-10"
+    assert metadata["canonical_parity"] == "знаменатель"
+    assert metadata["redirect_detected"] is False
+
+
 def test_canonical_hidden_schedule_is_valid_without_selected_group(tmp_path: Path):
     html = """<!doctype html><html><head><style>
       #schedule-container { display: none; width: 720px; color: #111; background: #fff; }

@@ -49,9 +49,9 @@ def test_dom_consistency_frozen_html_parsing(tmp_path, monkeypatch):
     calls = []
     real_parse = browser_capture.parse_schedule_html
 
-    def recording_parse(source_html, target, group):
+    def recording_parse(source_html, target, group, **kwargs):
         calls.append(source_html)
-        return real_parse(source_html, target, group)
+        return real_parse(source_html, target, group, **kwargs)
 
     monkeypatch.setattr(browser_capture, "parse_schedule_html", recording_parse)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -113,11 +113,11 @@ def test_dom_consistency_intermediate_verification(tmp_path, monkeypatch):
     parse_calls = []
     real_parse = browser_capture.parse_schedule_html
 
-    def recording_parse(source_html, target, group):
+    def recording_parse(source_html, target, group, **kwargs):
         # Track what we're parsing
         has_wednesday = "Ср." in source_html
         parse_calls.append({"has_wednesday": has_wednesday, "html_len": len(source_html)})
-        return real_parse(source_html, target, group)
+        return real_parse(source_html, target, group, **kwargs)
 
     monkeypatch.setattr(browser_capture, "parse_schedule_html", recording_parse)
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
