@@ -41,6 +41,13 @@ jobs:
           TZ: Europe/Moscow
           IB261_DIAGNOSTICS_DIR: ${{ runner.temp }}/ib261-diagnostics
         run: uv run python scripts/fetch_schedule.py
+      - name: Verify published snapshot files
+        env:
+          REQUESTED_DATE: ${{ inputs.date }}
+        run: |
+          test -s published-schedules/schedule.json
+          test -s published-schedules/schedule.png
+          uv run python scripts/validate_publication.py published-schedules
       - name: Finalize browser diagnostics
         if: always()
         env:
@@ -66,12 +73,18 @@ jobs:
           retention-days: 7
       - name: Commit only changed verified publication
         run: |
-          if git diff --quiet -- published-schedules; then
-            echo "No verified data change"
-            exit 0
+          pwd
+          find published-schedules -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          git status --short
+          sha256sum published-schedules/schedule.json published-schedules/schedule.png
+          git add published-schedules/schedule.json published-schedules/schedule.png published-schedules
+          if git diff --cached --quiet -- published-schedules; then
+            echo "Published files are unchanged"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update verified IB-261 schedule"
+            git push origin HEAD:main
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add published-schedules
-          git commit -m "chore: update verified IB-261 schedule"
-          git push
+          test -n "$(git ls-files --error-unmatch published-schedules/schedule.json)"
+          test -n "$(git ls-files --error-unmatch published-schedules/schedule.png)"

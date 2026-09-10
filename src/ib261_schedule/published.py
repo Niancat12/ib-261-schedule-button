@@ -160,11 +160,15 @@ def publish_snapshot(
     day_dir = Path(root) / schedule.schedule_date.isoformat()
     day_dir.mkdir(parents=True, exist_ok=True)
     latest = day_dir / "latest.json"
+    root_json = Path(root) / "schedule.json"
+    root_png = Path(root) / "schedule.png"
     if latest.is_file():
         old = json.loads(latest.read_text(encoding="utf-8"))
         if (
             old.get("data_sha256") == payload["data_sha256"]
             and old.get("screenshot_sha256") == payload["screenshot_sha256"]
+            and root_json.is_file()
+            and root_png.is_file()
         ):
             return False
     with tempfile.TemporaryDirectory(prefix=".publish-", dir=day_dir) as temp:
@@ -178,6 +182,12 @@ def publish_snapshot(
         final_png = day_dir / "schedule.png"
         staged_pointer = temp_path / "latest.json"
         staged_pointer.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        staged_root_json = temp_path / "root-schedule.json"
+        staged_root_png = temp_path / "root-schedule.png"
+        staged_root_json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        staged_root_png.write_bytes(image)
         backups: list[tuple[Path, Path]] = []
 
         def backup(path: Path) -> None:
@@ -195,6 +205,10 @@ def publish_snapshot(
             os.replace(staged_json, final_json)
             os.replace(staged_png, final_png)
             os.replace(staged_pointer, latest)
+            backup(root_json)
+            backup(root_png)
+            os.replace(staged_root_json, root_json)
+            os.replace(staged_root_png, root_png)
         except Exception:
             for path in (final_json, final_png, latest):
                 try:

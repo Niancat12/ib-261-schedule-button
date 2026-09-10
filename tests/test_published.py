@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import ib261_schedule.published as published
+from scripts import validate_publication
 from ib261_schedule.published import (
     load_latest,
     publish_snapshot,
@@ -56,6 +57,8 @@ def test_atomic_publish_changes_only_when_hash_changes(tmp_path):
     assert publish_snapshot(
         root, schedule(), checked, "https://cchgeu.ru/studentu/onlayn-raspisanie/", PNG
     )
+    assert (root / "schedule.json").is_file()
+    assert (root / "schedule.png").read_bytes() == PNG
     assert not publish_snapshot(
         root, schedule(), checked, "https://cchgeu.ru/studentu/onlayn-raspisanie/", PNG
     )
@@ -70,6 +73,24 @@ def test_atomic_publish_changes_only_when_hash_changes(tmp_path):
         root, date(2026, 9, 8), max_age=timedelta(hours=1), now=checked + timedelta(minutes=5)
     )
     assert payload["group"] == "ИБ-261" and image == PNG and fresh
+
+
+def test_validate_publication_checks_root_files_and_requested_date(tmp_path, monkeypatch):
+    checked = datetime(2026, 9, 8, 10, tzinfo=__import__("datetime").timezone.utc)
+    root = tmp_path / "published"
+    publish_snapshot(root, schedule(), checked, "https://cchgeu.ru/studentu/onlayn-raspisanie/", PNG)
+    monkeypatch.setenv("REQUESTED_DATE", "2026-09-08")
+    monkeypatch.setattr("sys.argv", ["validate_publication.py", str(root)])
+    assert validate_publication.main() == 0
+
+
+def test_validate_publication_rejects_missing_root_file(tmp_path, monkeypatch):
+    root = tmp_path / "published"
+    root.mkdir()
+    (root / "schedule.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["validate_publication.py", str(root)])
+    with pytest.raises(SystemExit, match="missing"):
+        validate_publication.main()
 
 
 def test_old_snapshot_is_marked_stale(tmp_path):
@@ -93,6 +114,8 @@ def test_atomic_publish_rolls_back_when_second_file_replace_fails(tmp_path, monk
     day_dir = root / "2026-09-08"
     old_json = (day_dir / "schedule.json").read_bytes()
     old_png = (day_dir / "schedule.png").read_bytes()
+    old_root_json = (root / "schedule.json").read_bytes()
+    old_root_png = (root / "schedule.png").read_bytes()
     original_replace = published.os.replace
     failed = False
 
@@ -114,3 +137,5 @@ def test_atomic_publish_rolls_back_when_second_file_replace_fails(tmp_path, monk
         )
     assert (day_dir / "schedule.json").read_bytes() == old_json
     assert (day_dir / "schedule.png").read_bytes() == old_png
+    assert (root / "schedule.json").read_bytes() == old_root_json
+    assert (root / "schedule.png").read_bytes() == old_root_png

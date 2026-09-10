@@ -10,7 +10,8 @@ from ib261_schedule.browser_capture import capture_live
 from ib261_schedule.published import publish_snapshot
 from ib261_schedule.source import SOURCE_URL
 
-ROOT = Path(__file__).resolve().parents[1] / "published-schedules"
+WORKSPACE = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[1])).resolve()
+ROOT = WORKSPACE / "published-schedules"
 
 
 def main() -> int:
