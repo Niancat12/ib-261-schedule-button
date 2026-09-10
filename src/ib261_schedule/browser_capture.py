@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlparse, urlunsplit
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,7 +14,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from .schedule import DaySchedule, ScheduleParseError, parse_schedule_html
-from .source import build_source_url
+from .source import SOURCE_URL, build_canonical_url, build_source_url
 
 UrlBuilder = Callable[[date, str], str]
 _WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
@@ -53,6 +53,124 @@ def _response_is_target_group(response, group: str) -> bool:
     except Exception:
         post_data = ""
     return _response_mentions_group(post_data, group)
+
+
+def _extract_parity(page) -> str:
+    """Read the source's currently active week type without guessing it."""
+    value = page.evaluate(
+        """() => {
+          const values = [];
+          const add = (node) => {
+            if (!node) return;
+            const text = (node.innerText || node.textContent || '').trim().toLowerCase();
+            if (text) values.push(text);
+          };
+          for (const node of document.querySelectorAll(
+            '[aria-pressed="true"], input:checked, .active, .selected, .btn.active'
+          )) add(node);
+          add(document.querySelector('#schedule-container h2'));
+          add(document.querySelector('#todayDate'));
+          for (const text of values) {
+            if (text.includes('числитель')) return 'числитель';
+            if (text.includes('знаменатель')) return 'знаменатель';
+          }
+          return '';
+        }"""
+    )
+    if value not in {"числитель", "знаменатель"}:
+        raise ScheduleParseError("Источник не подтвердил активный тип учебной недели")
+    return value
+
+
+def _canonical_url(bootstrap_url: str, target: date, group: str, parity: str) -> str:
+    """Use the official canonical path, preserving local test origins when supplied."""
+    parsed = urlparse(bootstrap_url)
+    if parsed.hostname == urlparse(SOURCE_URL).hostname:
+        return build_canonical_url(target, group, parity)
+    base_path = parsed.path.rstrip("/") or "/"
+    path = f"{base_path}/{quote(group, safe='')}/{target.isoformat()}/{quote(parity, safe='')}"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _canonical_state(page, target: date, group: str, parity: str) -> dict[str, Any]:
+    return page.evaluate(
+        r"""({target, group, parity}) => {
+          const decode = (value) => { try { return decodeURIComponent(value); } catch (_) { return ''; } };
+          const parts = location.pathname.split('/').filter(Boolean).slice(-3).map(decode);
+          const select = document.querySelector('#gruppa');
+          const selectedText = select?.selectedOptions?.[0]?.textContent?.trim() || '';
+          const body = document.body?.innerText || '';
+          const container = document.querySelector('#schedule-container');
+          const text = container?.innerText || '';
+          const dateParts = target.split('-').map(Number);
+          const dateTexts = [
+            target,
+            `${dateParts[2]}.${dateParts[1]}.${dateParts[0]}`,
+            `${String(dateParts[2]).padStart(2, '0')}.${String(dateParts[1]).padStart(2, '0')}.${dateParts[0]}`,
+          ];
+          const active = [...document.querySelectorAll('[aria-pressed="true"], input:checked, .active, .selected, .btn.active')]
+            .map((node) => (node.innerText || node.textContent || '').trim().toLowerCase())
+            .find((value) => value.includes('числитель') || value.includes('знаменатель')) || '';
+          const heading = (document.querySelector('#schedule-container h2')?.innerText || '').toLowerCase();
+          const parityText = active || heading;
+          const hasLesson = /\d{2}:\d{2}\s*[-–—]\s*\d{2}:\d{2}/.test(text);
+          const explicitEmpty = /нет занятий|занятий нет/i.test(text);
+          return {
+            pathParts: parts,
+            selectedGroup: select?.value || '',
+            selectedText,
+            title: document.title || '',
+            dateMatches: dateTexts.some((value) => body.includes(value) || (document.title || '').includes(value)),
+            parityMatches: parityText.includes(parity),
+            parityText,
+            promptPresent: /Выберете преподавателя или группу/i.test(body),
+            containerClass: container?.className || '',
+            scheduleText: text,
+            containerVisible: !!container && !!(container.offsetWidth || container.offsetHeight),
+            hasContent: hasLesson || explicitEmpty,
+            finalUrl: location.href
+          };
+        }""",
+        {"target": target.isoformat(), "group": group, "parity": parity},
+    )
+
+
+def _wait_for_canonical_state(page, target: date, group: str, parity: str, timeout_ms: int) -> dict[str, Any]:
+    expected = {"target": target.isoformat(), "group": group, "parity": parity}
+    try:
+        page.wait_for_function(
+            r"""expected => {
+              const state = (() => {
+                const decode = (value) => { try { return decodeURIComponent(value); } catch (_) { return ''; } };
+                const parts = location.pathname.split('/').filter(Boolean).slice(-3).map(decode);
+                const select = document.querySelector('#gruppa');
+                const body = document.body?.innerText || '';
+                const container = document.querySelector('#schedule-container');
+                const text = container?.innerText || '';
+                const dateParts = expected.target.split('-').map(Number);
+                const dateTexts = [
+                  expected.target,
+                  `${dateParts[2]}.${dateParts[1]}.${dateParts[0]}`,
+                  `${String(dateParts[2]).padStart(2, '0')}.${String(dateParts[1]).padStart(2, '0')}.${dateParts[0]}`,
+                ];
+                const active = [...document.querySelectorAll('[aria-pressed="true"], input:checked, .active, .selected, .btn.active')]
+                  .map((node) => (node.innerText || node.textContent || '').trim().toLowerCase())
+                  .find((value) => value.includes('числитель') || value.includes('знаменатель')) || '';
+                const heading = (document.querySelector('#schedule-container h2')?.innerText || '').toLowerCase();
+                const parityText = active || heading;
+                const hasContent = /\d{2}:\d{2}\s*[-–—]\s*\d{2}:\d{2}/.test(text) || /нет занятий|занятий нет/i.test(text);
+                return parts.length === 3 && parts[0] === expected.group && parts[1] === expected.target && parts[2] === expected.parity &&
+                  select?.value === expected.group && dateTexts.some((value) => body.includes(value)) && parityText.includes(expected.parity) &&
+                  !!container && !!(container.offsetWidth || container.offsetHeight) && !/Выберете преподавателя или группу/i.test(body) && hasContent;
+              })();
+              return state;
+            }""",
+            arg=expected,
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise ScheduleParseError("Канонический URL не подтвердил группу, дату, чётность и расписание") from exc
+    return _canonical_state(page, target, group, parity)
 
 
 def _select_group(
@@ -126,7 +244,7 @@ def _wait_for_schedule_state(page, target: date, group: str, timeout_ms: int) ->
     }""", arg={"target": target.strftime("%d.%m.%Y"), "group": group}, timeout=timeout_ms)
 
 
-def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]], console_errors: list[str], page_errors: list[str], target_statuses: list[int] | None = None) -> None:
+def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]], console_errors: list[str], page_errors: list[str], target_statuses: list[int] | None = None, capture_metadata: dict[str, Any] | None = None) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     try: page.screenshot(path=str(directory / "page.png"), full_page=True)
     except Exception: pass
@@ -135,7 +253,10 @@ def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]]
     try:
         container = page.locator("#schedule-container")
         meta = {"url": page.url, "title": page.title(), "selects": _select_metadata(page), "page_text": page.locator("body").inner_text(timeout=1000) if page.locator("body").count() else "",
-            "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:], "target_group_http_statuses": (target_statuses or [])[-20:]}
+            "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "schedule_class": container.get_attribute("class") if container.count() else "",
+            "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:], "target_group_http_statuses": (target_statuses or [])[-20:]}
+        if capture_metadata:
+            meta.update(capture_metadata)
         (directory / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception: pass
 
@@ -166,6 +287,7 @@ def capture_live(
     target_statuses: list[int] = []
     console_errors: list[str] = []
     page_errors: list[str] = []
+    capture_metadata: dict[str, Any] = {"requested_url": url, "final_url": ""}
     try:
         with sync_playwright() as playwright:
             browser_options: dict[str, Any] = {}
@@ -190,11 +312,57 @@ def capture_live(
                 if response is None or response.status != 200:
                     status = response.status if response is not None else "no-response"
                     raise SourceUnavailable(f"VGTU HTTP {status}")
+                capture_metadata.update({
+                    "bootstrap_http_status": response.status,
+                    "bootstrap_content_type": response.headers.get("content-type", ""),
+                })
+                parity = _extract_parity(page)
+                # Select the exact option once on the bootstrap page so Select2 and
+                # diagnostics observe the same user-facing choice before navigation.
                 _select_group(page, group, timeout_ms, target_statuses=target_statuses)
+                canonical_url = _canonical_url(url, target, group, parity)
+                capture_metadata.update({
+                    "parity": parity,
+                    "selected_group": group,
+                    "selected_date": target.isoformat(),
+                    "requested_canonical_url": canonical_url,
+                })
                 try:
-                    _wait_for_schedule_state(page, target, group, timeout_ms)
+                    canonical_response = page.goto(canonical_url, wait_until="domcontentloaded", timeout=timeout_ms)
                 except PlaywrightTimeoutError as exc:
-                    raise SourceUnavailable("Интерфейс расписания не подтвердил выбор группы и даты") from exc
+                    raise SourceUnavailable("Сетевой тайм-аут при открытии канонического URL расписания") from exc
+                capture_metadata.update({
+                    "final_url": page.url,
+                    "http_status": canonical_response.status if canonical_response is not None else None,
+                    "content_type": canonical_response.headers.get("content-type", "") if canonical_response is not None else "",
+                })
+                if canonical_response is None or canonical_response.status != 200:
+                    status = canonical_response.status if canonical_response is not None else "no-response"
+                    raise SourceUnavailable(f"Канонический URL расписания вернул HTTP {status}")
+                state = _canonical_state(page, target, group, parity)
+                if state.get("selectedGroup") != group:
+                    raise ScheduleParseError("Канонический URL не выбрал требуемую группу")
+                _wait_for_canonical_state(page, target, group, parity, timeout_ms)
+                capture_metadata.update({
+                    "final_url": page.url,
+                    "selected_group": state.get("selectedGroup") or group,
+                    "selected_group_text": state.get("selectedText", ""),
+                    "parity_text": state.get("parityText", ""),
+                    "schedule_class": state.get("containerClass", ""),
+                    "schedule_text": state.get("scheduleText", ""),
+                })
+                try:
+                    state = _canonical_state(page, target, group, parity)
+                    capture_metadata.update({
+                        "final_url": state.get("finalUrl", page.url),
+                        "selected_group": state.get("selectedGroup", ""),
+                        "selected_group_text": state.get("selectedText", ""),
+                        "parity_text": state.get("parityText", ""),
+                        "schedule_class": state.get("containerClass", ""),
+                        "schedule_text": state.get("scheduleText", ""),
+                    })
+                except Exception:
+                    pass
 
                 # STEP (A): Freeze document before any mutations
                 frozen = page.evaluate(
@@ -324,6 +492,7 @@ def capture_live(
                     _write_diagnostics(
                         page, diagnostics_dir, responses=responses,
                         console_errors=console_errors, page_errors=page_errors, target_statuses=target_statuses,
+                        capture_metadata=capture_metadata,
                     )
                 raise
             finally:
@@ -335,7 +504,7 @@ def capture_live(
                 _write_diagnostics(
                     page, diagnostics_dir, responses=responses,
                     console_errors=console_errors, page_errors=page_errors,
-                    target_statuses=target_statuses,
+                    target_statuses=target_statuses, capture_metadata=capture_metadata,
                 )
             else:
                 diagnostics_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +515,7 @@ def capture_live(
                         "console_errors": console_errors[-100:],
                         "page_errors": page_errors[-100:],
                         "target_group_http_statuses": target_statuses[-20:],
+                        **capture_metadata,
                         "error": type(exc).__name__,
                     }, ensure_ascii=False, indent=2), encoding="utf-8"
                 )

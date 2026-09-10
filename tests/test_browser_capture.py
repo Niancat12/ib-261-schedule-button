@@ -2,6 +2,7 @@ from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from urllib.parse import unquote
 
 from playwright.sync_api import Locator
 
@@ -115,7 +116,12 @@ def test_capture_live_selects_only_late_group_once_and_records_target_ajax(tmp_p
     class GroupHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             requests.append(self.path)
-            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers(); self.wfile.write(html.encode())
+            body = html
+            if len([part for part in unquote(self.path).split('/') if part]) >= 4:
+                body = body.replace("<option value='ИБ-261'>", "<option value='ИБ-261' selected>")
+                body = body.replace("<p id='prompt'>Выберете преподавателя или группу</p>", "")
+                body = body.replace("style='display:none'", "style='display:block'")
+            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers(); self.wfile.write(body.encode())
         def log_message(self, *args):
             pass
     selected_values: list[str] = []
@@ -164,3 +170,54 @@ def test_capture_live_writes_diagnostics_when_group_selection_fails(tmp_path: Pa
     assert (diagnostics / "page.html").is_file()
     metadata = (diagnostics / "metadata.json").read_text(encoding="utf-8")
     assert '"url"' in metadata and '"selects"' in metadata
+
+
+def test_capture_rejects_selected_group_when_ajax_leaves_empty_prompt(tmp_path: Path, monkeypatch):
+    diagnostics = tmp_path / "diagnostics"
+    monkeypatch.setenv("SCHEDULE_DIAGNOSTIC_DIR", str(diagnostics))
+    html = """<!doctype html><html><body>
+      <div id='todayDate'>Сегодня 08.09.2026, знаменатель</div>
+      <select id='gruppa'><option value='ИБ-261'>ИБ-261</option></select>
+      <select id='prepodavatel'><option value=''>Выберите преподавателя</option></select>
+      <span class='select2-selection__rendered'>ИБ-261</span>
+      <p>Выберете преподавателя или группу</p>
+      <div id='schedule-container' style='display:none'></div>
+      <script>
+        document.querySelector('#gruppa').addEventListener('change', () => fetch('/ajax/ИБ-261'));
+      </script>
+    </body></html>"""
+
+    class EmptyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), EmptyHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        try:
+            capture_live(
+                date(2026, 9, 8),
+                "ИБ-261",
+                tmp_path / "schedule.png",
+                url_builder=lambda *_: f"http://127.0.0.1:{server.server_port}/schedule",
+                timeout_ms=500,
+            )
+        except browser_capture.ScheduleParseError:
+            pass
+        else:
+            raise AssertionError("empty AJAX state must not be published")
+    finally:
+        server.shutdown()
+        thread.join()
+
+    metadata = (diagnostics / "metadata.json").read_text(encoding="utf-8")
+    assert "ИБ-261" in metadata
+    assert "Выберете преподавателя или группу" in metadata
+    assert not (tmp_path / "schedule.png").exists()

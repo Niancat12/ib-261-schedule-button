@@ -8,7 +8,7 @@ import pytest
 from ib261_schedule.cache import CacheStore
 from ib261_schedule.presentation import format_schedule
 from ib261_schedule.schedule import DaySchedule, Lesson
-from ib261_schedule.source import build_source_url
+from ib261_schedule.source import build_canonical_url, build_source_url
 
 MOSCOW = ZoneInfo("Europe/Moscow")
 
@@ -44,6 +44,14 @@ def test_source_url_preserves_exact_group_and_iso_date():
     assert "date=2026-09-08" in url
     assert "%D0%98%D0%91-261" in url
     assert "prepodavatel=" in url
+
+
+def test_canonical_source_url_encodes_group_date_and_parity_path():
+    url = build_canonical_url(date(2026, 9, 10), "ИБ-261", "знаменатель")
+    assert url.endswith(
+        "/%D0%98%D0%91-261/2026-09-10/"
+        "%D0%B7%D0%BD%D0%B0%D0%BC%D0%B5%D0%BD%D0%B0%D1%82%D0%B5%D0%BB%D1%8C"
+    )
 
 
 def test_format_schedule_includes_date_weekday_subgroups_source_and_check_time():
