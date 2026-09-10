@@ -7,7 +7,7 @@ from ib261_schedule.schedule import ScheduleParseError, parse_schedule_html
 HTML = """
 <html><body>
 <div id="todayDate">Сегодня 08.09.2026, знаменатель</div>
-<select id="gruppa"><option>Все</option><option selected>ИБ-261</option></select>
+<select id="gruppa"><option value="Все">Все</option><option value="ИБ-261" selected>ИБ-261</option></select>
 <div id="schedule-container">
 <section class="schedule-container visible">
 <h2 class="schedule-date">Расписание на знаменатель</h2>
@@ -54,7 +54,7 @@ def test_parse_fails_closed_when_selected_group_does_not_match():
 def test_parse_empty_day_reports_no_lessons():
     html = """
     <div id="todayDate">Сегодня 08.09.2026, знаменатель</div>
-    <select id="gruppa"><option selected>ИБ-261</option></select>
+    <select id="gruppa"><option value="ИБ-261" selected>ИБ-261</option></select>
     <div id="schedule-container"><h2>Расписание на знаменатель</h2><table>
     <tr><td><b>Вт.</b></td><td>Нет занятий</td></tr>
     </table></div>

@@ -21,7 +21,8 @@ HTML = """<!doctype html><html><head><meta charset='utf-8'><style>
 td { border: 1px solid black; padding: 8px; }
 </style></head><body>
 <div id='todayDate'>Сегодня 08.09.2026, знаменатель</div>
-<select id='gruppa'><option selected>ИБ-261</option></select>
+<select id='gruppa'><option value='ИБ-261' selected>ИБ-261</option></select>
+<select id='prepodavatel'><option value=''>Выберите преподавателя</option></select>
 <div id='schedule-container'><h2>Расписание на знаменатель</h2><table>
 <tr><td rowspan='2'><b>Вт.</b></td><td>08:30 - 10:05</td><td>Ауд. 430/3</td><td>1 п/г</td><td>Лабораторные занятия<br><b>Физика</b><br>Иванов Иван Иванович</td></tr>
 <tr><td>10:15 - 11:50</td><td>Ауд. 327/1</td><td>2 п/г</td><td>Практические занятия<br><b>История России</b><br>Петров Пётр Петрович</td></tr>

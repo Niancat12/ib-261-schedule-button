@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import unquote
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -27,55 +28,89 @@ def _select_metadata(page) -> list[dict[str, Any]]:
     return page.evaluate("""() => [...document.querySelectorAll('select')].map((el) => ({
       id: el.id || '', name: el.name || '', value: el.value || '',
       selectedText: el.selectedOptions?.[0]?.textContent?.trim() || '',
-      options: [...el.options].map((o) => ({value: o.value, text: o.textContent.trim()})).slice(0, 200)
+      options: [...el.options].map((o) => ({value: o.value, text: o.textContent.trim()}))
     }))""")
 
 
-def _select_group(page, group: str, timeout_ms: int) -> None:
-    """Select the dependent faculty/group controls and prove the UI accepted it."""
-    def find_group():
-        metadata = _select_metadata(page)
-        item = next((entry for entry in metadata if any(option.get("text", "").strip() == group for option in entry.get("options", []))), None)
-        if item is None:
-            return None
-        selector = f"select#{item['id']}" if item.get("id") else f"select[name='{item['name']}']"
-        return page.locator(selector).first
+def _response_mentions_group(response_url: str, group: str) -> bool:
+    return group.casefold() in unquote(response_url).casefold()
 
-    group_select = find_group()
-    if group_select is None:
-        # The group list is commonly populated after choosing a faculty/subdivision.
-        for item in _select_metadata(page):
-            selector = f"select#{item['id']}" if item.get("id") else (f"select[name='{item['name']}']" if item.get("name") else None)
-            if not selector:
-                continue
-            control = page.locator(selector).first
-            for option in item.get("options", [])[:50]:
-                value = option.get("value", "")
-                label = option.get("text", "").strip()
-                if not value or not label or label.casefold() in {"выберите", "выберите факультет", "все"}:
-                    continue
-                try:
-                    control.select_option(value, timeout=min(timeout_ms, 5000))
-                    control.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }")
-                    page.wait_for_timeout(250)
-                except Exception:
-                    continue
-                group_select = find_group()
-                if group_select is not None:
-                    break
-            if group_select is not None:
-                break
-    if group_select is None:
-        raise ScheduleParseError(f"Группа {group} отсутствует в интерфейсе источника")
-    current = group_select.locator("option:checked").inner_text().strip()
-    if current != group:
-        option = group_select.locator("option").filter(has_text=re.compile(rf"^{re.escape(group)}$"))
-        value = option.get_attribute("value")
-        if value is None:
-            raise ScheduleParseError(f"Группа {group} отсутствует в интерфейсе источника")
-        group_select.select_option(value, timeout=timeout_ms)
-    group_select.evaluate("el => { [...el.options].forEach(o => o.removeAttribute('selected')); el.selectedOptions[0]?.setAttribute('selected', 'selected'); el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }")
-    page.wait_for_function("expected => [...document.querySelectorAll('select option:checked')].some(o => o.textContent.trim() === expected)", arg=group, timeout=timeout_ms)
+
+def _response_is_target_group(response, group: str) -> bool:
+    """Identify the group schedule XHR without trusting analytics calls."""
+    try:
+        if response.request.resource_type not in {"xhr", "fetch"}:
+            return False
+    except Exception:
+        return False
+    lowered_url = response.url.casefold()
+    if any(marker in lowered_url for marker in ("google-analytics", "googletagmanager", "doubleclick", "metrika", "mc.yandex", "facebook")):
+        return False
+    if _response_mentions_group(response.url, group):
+        return True
+    try:
+        post_data = response.request.post_data or ""
+    except Exception:
+        post_data = ""
+    return _response_mentions_group(post_data, group)
+
+
+def _select_group(
+    page, group: str, timeout_ms: int, target_statuses: list[int] | None = None
+) -> None:
+    """Select only #gruppa; never probe or change unrelated group options."""
+    group_select = page.locator("select#gruppa").first
+    try:
+        group_select.wait_for(state="attached", timeout=timeout_ms)
+    except PlaywrightTimeoutError as exc:
+        raise ScheduleParseError("Интерфейс источника не содержит select#gruppa") from exc
+
+    option = page.locator(f'select#gruppa option[value="{group}"]').first
+    try:
+        option.wait_for(state="attached", timeout=timeout_ms)
+    except PlaywrightTimeoutError as exc:
+        raise ScheduleParseError(
+            f"Группа {group} отсутствует в интерфейсе источника после полной загрузки списка"
+        ) from exc
+
+    target_responses: list[int] = []
+
+    def on_response(response) -> None:
+        if _response_is_target_group(response, group):
+            target_responses.append(response.status)
+            if target_statuses is not None:
+                target_statuses.append(response.status)
+
+    page.on("response", on_response)
+    try:
+        # This is intentionally the only option mutation in the whole routine.
+        group_select.select_option(value=group, timeout=timeout_ms)
+        group_select.evaluate(
+            "el => { [...el.options].forEach(o => o.removeAttribute('selected')); "
+            "el.selectedOptions[0]?.setAttribute('selected', 'selected'); }"
+        )
+        page.wait_for_function(
+            "expected => document.querySelector('#gruppa')?.value === expected",
+            arg=group,
+            timeout=timeout_ms,
+        )
+
+        # Select2 mirrors the hidden select in a visible rendered selection.
+        rendered = page.locator(".select2-selection__rendered")
+        if rendered.count() and not rendered.filter(has_text=re.compile(rf"^{re.escape(group)}$")).count():
+            raise ScheduleParseError("Select2 не отобразил выбранную группу")
+
+        # Give the site's change handler time to issue its group-specific request.
+        # Static fixtures may have no AJAX at all; in that case content validation remains authoritative.
+        wait_ms = min(timeout_ms, 3_000)
+        elapsed = 0
+        while elapsed < wait_ms and not target_responses:
+            page.wait_for_timeout(100)
+            elapsed += 100
+        if target_responses and any(status >= 400 for status in target_responses):
+            raise SourceUnavailable(f"Целевой запрос группы {group} вернул HTTP {target_responses[-1]}")
+    finally:
+        page.remove_listener("response", on_response)
 
 
 def _wait_for_schedule_state(page, target: date, group: str, timeout_ms: int) -> None:
@@ -91,7 +126,7 @@ def _wait_for_schedule_state(page, target: date, group: str, timeout_ms: int) ->
     }""", arg={"target": target.strftime("%d.%m.%Y"), "group": group}, timeout=timeout_ms)
 
 
-def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]], console_errors: list[str], page_errors: list[str]) -> None:
+def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]], console_errors: list[str], page_errors: list[str], target_statuses: list[int] | None = None) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     try: page.screenshot(path=str(directory / "page.png"), full_page=True)
     except Exception: pass
@@ -100,7 +135,7 @@ def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]]
     try:
         container = page.locator("#schedule-container")
         meta = {"url": page.url, "title": page.title(), "selects": _select_metadata(page), "page_text": page.locator("body").inner_text(timeout=1000) if page.locator("body").count() else "",
-            "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:]}
+            "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:], "target_group_http_statuses": (target_statuses or [])[-20:]}
         (directory / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception: pass
 
@@ -128,6 +163,7 @@ def capture_live(
     diagnostics_dir = Path(diagnostic_env) if diagnostic_env else None
     page = None
     responses: list[dict[str, Any]] = []
+    target_statuses: list[int] = []
     console_errors: list[str] = []
     page_errors: list[str] = []
     try:
@@ -154,7 +190,7 @@ def capture_live(
                 if response is None or response.status != 200:
                     status = response.status if response is not None else "no-response"
                     raise SourceUnavailable(f"VGTU HTTP {status}")
-                _select_group(page, group, timeout_ms)
+                _select_group(page, group, timeout_ms, target_statuses=target_statuses)
                 try:
                     _wait_for_schedule_state(page, target, group, timeout_ms)
                 except PlaywrightTimeoutError as exc:
@@ -287,7 +323,7 @@ def capture_live(
                 if diagnostics_dir is not None and page is not None:
                     _write_diagnostics(
                         page, diagnostics_dir, responses=responses,
-                        console_errors=console_errors, page_errors=page_errors,
+                        console_errors=console_errors, page_errors=page_errors, target_statuses=target_statuses,
                     )
                 raise
             finally:
@@ -299,6 +335,7 @@ def capture_live(
                 _write_diagnostics(
                     page, diagnostics_dir, responses=responses,
                     console_errors=console_errors, page_errors=page_errors,
+                    target_statuses=target_statuses,
                 )
             else:
                 diagnostics_dir.mkdir(parents=True, exist_ok=True)
@@ -308,6 +345,7 @@ def capture_live(
                         "schedule_text": "", "responses": responses[-100:],
                         "console_errors": console_errors[-100:],
                         "page_errors": page_errors[-100:],
+                        "target_group_http_statuses": target_statuses[-20:],
                         "error": type(exc).__name__,
                     }, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
