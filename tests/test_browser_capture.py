@@ -34,7 +34,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def test_capture_live_freezes_then_revalidates_filtered_dom_before_screenshot(
+def test_capture_live_uses_one_weekly_snapshot_for_parse_and_screenshot(
     tmp_path: Path, monkeypatch
 ):
     calls: list[str] = []
@@ -60,10 +60,9 @@ def test_capture_live_freezes_then_revalidates_filtered_dom_before_screenshot(
         server.shutdown()
         thread.join()
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert "Русский язык" in calls[0]
-    assert "Русский язык" not in calls[1]
-    assert "Физика" in calls[1] and "История России" in calls[1]
+    assert "Физика" in calls[0] and "История России" in calls[0]
 
 
 def test_capture_live_parses_and_screenshots_the_same_dom(tmp_path: Path):
@@ -88,7 +87,7 @@ def test_capture_live_parses_and_screenshots_the_same_dom(tmp_path: Path):
     assert output.is_file() and output.stat().st_size > 1000
 
 
-def test_capture_live_selects_only_late_group_once_and_records_target_ajax(tmp_path: Path, monkeypatch):
+def test_capture_live_uses_canonical_url_without_selecting_intermediate_groups(tmp_path: Path, monkeypatch):
     options = "".join(f"<option value='G-{index}'>G-{index}</option>" for index in range(4200))
     html = f"""<!doctype html><html><body>
     <div id='todayDate'>Сегодня 08.09.2026, знаменатель</div>
@@ -140,9 +139,9 @@ def test_capture_live_selects_only_late_group_once_and_records_target_ajax(tmp_p
         server.shutdown(); thread.join()
     assert schedule.group == 'ИБ-261'
     assert schedule.lessons
-    assert selected_values == ["ИБ-261"]
-    target_requests = [path for path in requests if "group=" in path]
-    assert target_requests == ["/schedule?group=%D0%98%D0%91-261"]
+    assert selected_values == []
+    assert any("%D0%98%D0%91-261" in path for path in requests)
+    assert not any("group=" in path for path in requests)
 
 
 def test_capture_live_writes_diagnostics_when_group_selection_fails(tmp_path: Path, monkeypatch):
@@ -150,9 +149,9 @@ def test_capture_live_writes_diagnostics_when_group_selection_fails(tmp_path: Pa
     monkeypatch.setenv("SCHEDULE_DIAGNOSTIC_DIR", str(diagnostics))
     monkeypatch.setattr(
         browser_capture,
-        "_select_group",
+        "_extract_parity",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            browser_capture.ScheduleParseError("group missing")
+            browser_capture.ScheduleParseError("parity missing")
         ),
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -163,7 +162,7 @@ def test_capture_live_writes_diagnostics_when_group_selection_fails(tmp_path: Pa
         except browser_capture.ScheduleParseError:
             pass
         else:
-            raise AssertionError("expected group selection failure")
+            raise AssertionError("expected bootstrap validation failure")
     finally:
         server.shutdown(); thread.join()
     assert (diagnostics / "page.png").is_file()

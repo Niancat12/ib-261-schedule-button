@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 from lxml import html
 
@@ -99,7 +99,26 @@ def _parity(tree) -> str:
 
 def _weekday_from_cell(text: str) -> str | None:
     normalized = _clean(text).rstrip(".")
-    return normalized if normalized in _WEEKDAYS.values() else None
+    if normalized in _WEEKDAYS.values():
+        return normalized
+    for label in _WEEKDAYS.values():
+        if re.match(rf"^{re.escape(label)}(?:\.|\s|$)", normalized, flags=re.IGNORECASE):
+            return label
+    return None
+
+
+def week_monday(value: date) -> date:
+    """Return the Monday anchoring the source's seven-day table."""
+    return value - timedelta(days=value.weekday())
+
+
+def weekday_date(monday: date, weekday: str) -> date:
+    """Map an official weekday label (Пн.–Вс.) to its calendar date."""
+    try:
+        index = next(index for index, label in _WEEKDAYS.items() if label == weekday)
+    except StopIteration as exc:
+        raise ScheduleParseError(f"Неизвестный день недели: {weekday}") from exc
+    return monday + timedelta(days=index)
 
 
 def _lesson_from_cells(cells: list) -> Lesson | None:
@@ -180,7 +199,7 @@ def _lesson_from_cells(cells: list) -> Lesson | None:
     )
 
 
-def parse_schedule_html(source_html: str, requested_date: date, group: str) -> DaySchedule:
+def _parse_week_tree(source_html: str, requested_date: date, group: str) -> tuple[dict[date, tuple[Lesson, ...]], set[date], str]:
     try:
         tree = html.fromstring(source_html)
     except (ValueError, TypeError) as exc:
@@ -200,11 +219,10 @@ def parse_schedule_html(source_html: str, requested_date: date, group: str) -> D
     if selected_group is None and not _group_option_exists(tree, group):
         raise ScheduleParseError("Источник не содержит требуемую группу")
 
-    target_weekday = _WEEKDAYS[requested_date.weekday()]
+    monday = week_monday(requested_date)
     active_weekday: str | None = None
-    lessons: list[Lesson] = []
-    target_seen = False
-    explicit_no_lessons = False
+    lessons_by_date: dict[date, list[Lesson]] = {}
+    empty_days: set[date] = set()
 
     for row in containers[0].xpath(".//tr[not(contains(@style, 'display:none'))]"):
         cells = row.xpath("./th | ./td")
@@ -217,27 +235,52 @@ def parse_schedule_html(source_html: str, requested_date: date, group: str) -> D
         if row_weekday:
             active_weekday = row_weekday
             cells = cells[1:]
-        if active_weekday != target_weekday:
+        if active_weekday is None:
             continue
-        target_seen = True
+        current_date = weekday_date(monday, active_weekday)
         joined = _clean(" ".join(" ".join(cell.itertext()) for cell in cells))
         if "Нет занятий" in joined:
-            explicit_no_lessons = True
+            empty_days.add(current_date)
             continue
         lesson = _lesson_from_cells(cells)
         if lesson is None:
-            raise ScheduleParseError("Не удалось распознать строку выбранного дня")
-        lessons.append(lesson)
+            raise ScheduleParseError("Не удалось распознать строку выбранного дня или недели")
+        lessons_by_date.setdefault(current_date, []).append(lesson)
 
-    if not target_seen:
+    all_dates = set(lessons_by_date) | empty_days
+    if not all_dates:
+        raise ScheduleParseError("Источник не содержит дней недельного расписания")
+    return {key: tuple(value) for key, value in lessons_by_date.items()}, empty_days, _parity(tree)
+
+
+def parse_week_schedule_html(source_html: str, requested_date: date, group: str) -> dict[date, DaySchedule]:
+    """Parse the complete official weekly table using the requested date as its anchor.
+
+    The source returns Monday-through-Sunday regardless of the requested weekday.  The
+    requested date therefore identifies the week, not the first row in the table.
+    """
+    lessons_by_date, empty_days, parity = _parse_week_tree(source_html, requested_date, group)
+    monday = week_monday(requested_date)
+    result: dict[date, DaySchedule] = {}
+    for offset in range(7):
+        current = monday + timedelta(days=offset)
+        if current not in lessons_by_date and current not in empty_days:
+            continue
+        result[current] = DaySchedule(
+            group=group,
+            schedule_date=current,
+            parity=parity,
+            lessons=lessons_by_date.get(current, ()),
+            empty_confirmed=current in empty_days and not lessons_by_date.get(current),
+        )
+    return result
+
+
+def parse_schedule_html(source_html: str, requested_date: date, group: str) -> DaySchedule:
+    week = parse_week_schedule_html(source_html, requested_date, group)
+    schedule = week.get(requested_date)
+    if schedule is None:
         raise ScheduleParseError("Источник не содержит выбранный день недели")
-    if not lessons and not explicit_no_lessons:
+    if not schedule.lessons and not schedule.empty_confirmed:
         raise ScheduleParseError("Источник не подтвердил наличие или отсутствие занятий")
-
-    return DaySchedule(
-        group=group,
-        schedule_date=requested_date,
-        parity=_parity(tree),
-        lessons=tuple(lessons),
-        empty_confirmed=explicit_no_lessons,
-    )
+    return schedule

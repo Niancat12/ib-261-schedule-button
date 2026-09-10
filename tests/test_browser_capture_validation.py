@@ -109,3 +109,12 @@ def test_http_403_is_not_retried(monkeypatch, tmp_path: Path):
 def test_corrupt_png_is_rejected():
     with pytest.raises(SourceIntegrityError):
         browser_capture._png_stats(b"not-a-png")
+
+
+def test_diagnostics_redact_credentials_and_bearer_values():
+    redacted = browser_capture._redact_diagnostic(
+        "Authorization: Bearer top-secret token=abc123 proxy_url=https://user:pass@example.invalid"
+    )
+    assert "top-secret" not in redacted
+    assert "abc123" not in redacted
+    assert "user:pass" not in redacted

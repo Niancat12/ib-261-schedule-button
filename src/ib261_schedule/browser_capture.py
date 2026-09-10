@@ -19,7 +19,13 @@ from zoneinfo import ZoneInfo
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from .schedule import DaySchedule, ScheduleParseError, parse_schedule_html
+from .schedule import (
+    DaySchedule,
+    ScheduleParseError,
+    parse_schedule_html,
+    parse_week_schedule_html,
+    week_monday,
+)
 from .source import SOURCE_URL, build_canonical_url, build_source_url
 
 UrlBuilder = Callable[[date, str], str]
@@ -81,6 +87,25 @@ def _looks_like_error_page(title: str, text: str) -> bool:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)(authorization|cookie|set-cookie|proxy(?:[_ -]?url)?|api[_ -]?key|token|secret)"
+    r"(\s*[:=]\s*)([^\s,;<>\"']+)"
+)
+_DIAGNOSTIC_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;<>\"']+")
+
+
+def _redact_diagnostic(value: Any) -> Any:
+    """Remove credential-shaped values before writing browser diagnostics."""
+    if isinstance(value, str):
+        value = _DIAGNOSTIC_BEARER_RE.sub("Bearer <redacted>", value)
+        return _DIAGNOSTIC_SECRET_RE.sub(r"\1\2<redacted>", value)
+    if isinstance(value, list):
+        return [_redact_diagnostic(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_diagnostic(item) for key, item in value.items()}
+    return value
 
 
 def _select_metadata(page) -> list[dict[str, Any]]:
@@ -174,6 +199,9 @@ def _canonical_state(page, target: date, group: str, parity: str) -> dict[str, A
           const select = document.querySelector('#gruppa');
           const selectedText = select?.selectedOptions?.[0]?.textContent?.trim() || '';
           const body = document.body?.textContent || '';
+          const bodyClone = document.body?.cloneNode(true);
+          bodyClone?.querySelectorAll('script, style, noscript').forEach((node) => node.remove());
+          const safeBody = bodyClone?.textContent || body;
           const container = document.querySelector('#schedule-container');
           const text = container?.textContent || '';
           const options = [...document.querySelectorAll('#gruppa option')];
@@ -189,9 +217,16 @@ def _canonical_state(page, target: date, group: str, parity: str) -> dict[str, A
             return matches.length === 1 ? matches[0] : '';
           };
           const weekNode = document.querySelector('#weekParity');
-          const weekParity = parityFrom(weekNode?.value || weekNode?.dataset?.parity || weekNode?.textContent);
           const activeNodes = [...document.querySelectorAll('#weekParity.active, #weekParity .active, #weekParity [aria-pressed="true"], #weekParity [data-week-parity].active, #weekParity [data-week-parity][aria-pressed="true"], [data-week-parity].active, [data-week-parity][aria-pressed="true"], button.active, [role="button"].active')];
-          const active = activeNodes.map((node) => parityFrom(node.innerText || node.textContent)).find(Boolean) || '';
+          const activeValues = activeNodes.map((node) => parityFrom(node.innerText || node.textContent)).filter(Boolean);
+          const active = activeValues[0] || '';
+          const weekValues = [
+            weekNode?.value,
+            weekNode?.dataset?.parity,
+            ...(weekNode ? [...weekNode.querySelectorAll('.active, [aria-pressed="true"], [data-week-parity]')].map((node) => node.innerText || node.textContent) : []),
+          ].map(parityFrom).filter(Boolean);
+          const weekText = parityFrom(weekNode?.textContent);
+          const weekParity = weekValues[0] || weekText || '';
           const activeParityControlPresent = activeNodes.length > 0;
           const todayDateText = (document.querySelector('#todayDate')?.textContent || '').trim();
           const heading = (document.querySelector('#schedule-container h2')?.textContent || '').toLowerCase();
@@ -209,17 +244,17 @@ def _canonical_state(page, target: date, group: str, parity: str) -> dict[str, A
             selectedText,
             groupOptionExists: options.some((option) => option.value === group || (option.textContent || '').trim() === group),
             title: document.title || '',
-            pageText: body,
-            dateMatches: dateHeaderMatches || dateTexts.some((value) => body.includes(value) || (document.title || '').includes(value)),
+            pageText: safeBody,
+            dateMatches: dateHeaderMatches || dateTexts.some((value) => safeBody.includes(value) || (document.title || '').includes(value)),
             dateHeaderMatches,
             todayDateText,
-            parityMatches: parityText.includes(parity) && (!weekNode || weekParity === parity) && (!activeParityControlPresent || active === parity),
+            parityMatches: parityText.includes(parity) && (!weekNode || weekParity === parity || active === parity) && (!activeParityControlPresent || active === parity),
             weekParityText: weekParity,
             activeParityText: active,
             activeParityControlPresent,
             parityText,
             headingPresent,
-            promptPresent: /Выберете преподавателя или группу/i.test(body),
+            promptPresent: /Выберете преподавателя или группу/i.test(safeBody) || /Выберете преподавателя или группу/i.test(text),
             containerClass: container?.className || '',
             scheduleText: text,
             containerVisible: !!container && !!(container.offsetWidth || container.offsetHeight),
@@ -235,54 +270,11 @@ def _canonical_state(page, target: date, group: str, parity: str) -> dict[str, A
 
 
 def _wait_for_canonical_state(page, target: date, group: str, parity: str, timeout_ms: int) -> dict[str, Any]:
-    expected = {"target": target.isoformat(), "group": group, "parity": parity}
     try:
-        page.wait_for_function(
-            r"""expected => {
-              const state = (() => {
-                const decode = (value) => { try { return decodeURIComponent(value); } catch (_) { return ''; } };
-                const parts = location.pathname.split('/').filter(Boolean).slice(-3).map(decode);
-                const body = document.body?.textContent || '';
-                const container = document.querySelector('#schedule-container');
-                const table = container?.querySelector('table');
-                const text = container?.textContent || '';
-                const options = [...document.querySelectorAll('#gruppa option')];
-                const dateParts = expected.target.split('-').map(Number);
-                const dateTexts = [
-                  expected.target,
-                  `${dateParts[2]}.${dateParts[1]}.${dateParts[0]}`,
-                  `${String(dateParts[2]).padStart(2, '0')}.${String(dateParts[1]).padStart(2, '0')}.${dateParts[0]}`,
-                ];
-                const parityFrom = (value) => {
-                  const text = (value || '').trim().toLowerCase();
-                  const matches = ['числитель', 'знаменатель'].filter((item) => text.includes(item));
-                  return matches.length === 1 ? matches[0] : '';
-                };
-                const weekNode = document.querySelector('#weekParity');
-                const weekParity = parityFrom(weekNode?.value || weekNode?.dataset?.parity || weekNode?.textContent);
-                const activeNodes = [...document.querySelectorAll('#weekParity.active, #weekParity .active, #weekParity [aria-pressed="true"], #weekParity [data-week-parity].active, #weekParity [data-week-parity][aria-pressed="true"], [data-week-parity].active, [data-week-parity][aria-pressed="true"], button.active, [role="button"].active')];
-                const active = activeNodes.map((node) => parityFrom(node.innerText || node.textContent)).find(Boolean) || '';
-                const heading = (document.querySelector('#schedule-container h2')?.textContent || '').toLowerCase();
-                const headingPresent = !!document.querySelector('#schedule-container h1, #schedule-container h2, #schedule-container h3');
-                const todayDateText = (document.querySelector('#todayDate')?.textContent || '').trim();
-                const parityText = [weekParity, active, parityFrom(heading), parityFrom(todayDateText)].filter(Boolean).join(' | ');
-                const dateHeaderMatches = dateTexts.some((value) => todayDateText.includes(value));
-                const parityOk = parityText.includes(expected.parity) &&
-                  (!weekNode || weekParity === expected.parity) &&
-                  (!activeNodes.length || active === expected.parity);
-                const hasContent = /\d{2}:\d{2}\s*[-–—]\s*\d{2}:\d{2}/.test(text) || /нет занятий|занятий нет/i.test(text);
-                return parts.length === 3 && parts[0] === expected.group && parts[1] === expected.target && parts[2] === expected.parity &&
-                  options.some((option) => option.value === expected.group || (option.textContent || '').trim() === expected.group) &&
-                  (dateHeaderMatches || dateTexts.some((value) => body.includes(value))) && parityOk &&
-                  !!container && !!table && headingPresent && !/Выберете преподавателя или группу/i.test(body) && hasContent;
-              })();
-              return state;
-            }""",
-            arg=expected,
-            timeout=timeout_ms,
-        )
+        page.wait_for_selector("#schedule-container", state="attached", timeout=timeout_ms)
+        page.locator("#schedule-container table").first.wait_for(state="attached", timeout=timeout_ms)
     except PlaywrightTimeoutError as exc:
-        raise ScheduleParseError("Канонический URL не подтвердил группу, дату, чётность и расписание") from exc
+        raise ScheduleParseError("Канонический snapshot не содержит прикреплённую таблицу расписания") from exc
     return _canonical_state(page, target, group, parity)
 
 
@@ -494,7 +486,9 @@ def _write_diagnostics(
     except Exception:
         pass
     try:
-        (directory / "page.html").write_text(page.content(), encoding="utf-8")
+        (directory / "page.html").write_text(
+            _redact_diagnostic(page.content()), encoding="utf-8"
+        )
     except Exception:
         pass
 
@@ -540,6 +534,7 @@ def _write_diagnostics(
         # capture_metadata is diagnostic-only; never let an unserialisable value
         # suppress the basic page/select/network record.
         meta["capture_metadata_error"] = True
+    meta = _redact_diagnostic(meta)
     try:
         (directory / "metadata.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
@@ -557,20 +552,20 @@ def _capture_live_once(
     url_builder: UrlBuilder = build_source_url,
     timeout_ms: int = 35_000,
 ) -> tuple[DaySchedule, datetime]:
-    """
-    Capture live schedule with DOM consistency guarantees.
+    """Capture one official, server-rendered weekly snapshot.
 
-    Four-step process ensures parsed HTML and screenshot come from the same DOM state:
-    (A) Freeze document: Save page.content() before any mutations
-    (B) Parse frozen HTML: Parse the immutable snapshot
-    (C) Verify consistency: Re-check that selected group and schedule_date still match
-    (D) Filter & screenshot: Only then mutate display and take screenshot
+    The site JavaScript is known to reset the group select and replace a valid
+    schedule with a prompt.  Consequently the capture context deliberately has
+    JavaScript disabled.  The same frozen HTML is validated and parsed, while
+    the only later mutation is presentation CSS used to render the screenshot.
     """
     url = url_builder(target, group)
     output.parent.mkdir(parents=True, exist_ok=True)
     diagnostic_env = os.environ.get("SCHEDULE_DIAGNOSTIC_DIR", "").strip()
     diagnostics_dir = Path(diagnostic_env) if diagnostic_env else None
     page = None
+    browser = None
+    context = None
     responses: list[dict[str, Any]] = []
     target_statuses: list[int] = []
     console_errors: list[str] = []
@@ -578,7 +573,11 @@ def _capture_live_once(
     capture_metadata: dict[str, Any] = {
         "requested_bootstrap_url": url,
         "requested_url": url,
-        "requested_strategy": "canonical",
+        "requested_strategy": "canonical-server-snapshot",
+        "javascript_enabled": False,
+        "target_date": target.isoformat(),
+        "target_weekday": _WEEKDAYS[target.weekday()],
+        "computed_week_monday": week_monday(target).isoformat(),
         "final_url": "",
     }
     temporary_output: Path | None = None
@@ -590,93 +589,112 @@ def _capture_live_once(
             if proxy:
                 browser_options["proxy"] = {"server": proxy}
             browser = playwright.chromium.launch(headless=True, **browser_options)
-            try:
-                context = browser.new_context(
-                    timezone_id="Europe/Moscow",
-                    locale="ru-RU",
-                    viewport={"width": 1400, "height": 1200},
-                )
-                page = context.new_page()
-                page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
-                page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+            context = browser.new_context(
+                timezone_id="Europe/Moscow",
+                locale="ru-RU",
+                viewport={"width": 1400, "height": 1200},
+                java_script_enabled=False,
+            )
+            page = context.new_page()
+            page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+            page.on("pageerror", lambda exc: page_errors.append(str(exc)))
 
-                def record_response(response) -> None:
-                    try:
-                        resource_type = response.request.resource_type
-                    except Exception:
-                        return
-                    if resource_type not in {"document", "xhr", "fetch"}:
-                        return
-                    parsed = urlsplit(response.url)
-                    responses.append(
-                        {
-                            "url": urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")),
-                            "status": response.status,
-                            "resource_type": resource_type,
-                        }
-                    )
-
-                page.on("response", record_response)
+            def record_response(response) -> None:
                 try:
-                    response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    resource_type = response.request.resource_type
+                except Exception:
+                    return
+                if resource_type not in {"document", "xhr", "fetch"}:
+                    return
+                parsed = urlsplit(response.url)
+                responses.append(
+                    {
+                        "url": urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")),
+                        "status": response.status,
+                        "resource_type": resource_type,
+                        "content_type": response.headers.get("content-type", ""),
+                    }
+                )
+
+            page.on("response", record_response)
+            try:
+                try:
+                    bootstrap_response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 except PlaywrightTimeoutError as exc:
                     raise SourceUnavailable("Сетевой тайм-аут при открытии официального источника") from exc
-                if response is None or response.status != 200:
-                    status = response.status if response is not None else "no-response"
-                    raise SourceUnavailable(f"VGTU HTTP {status}")
+                if bootstrap_response is None or bootstrap_response.status != 200:
+                    status = bootstrap_response.status if bootstrap_response is not None else "no-response"
+                    raise SourceUnavailable(f"Официальный источник HTTP {status}")
+                bootstrap_content_type = bootstrap_response.headers.get("content-type", "")
                 capture_metadata.update({
-                    "bootstrap_http_status": response.status,
-                    "bootstrap_content_type": response.headers.get("content-type", ""),
+                    "bootstrap_http_status": bootstrap_response.status,
+                    "bootstrap_content_type": bootstrap_content_type,
                 })
-                if "text/html" not in response.headers.get("content-type", "").casefold():
+                if "text/html" not in bootstrap_content_type.casefold():
                     raise SourceIntegrityError("Bootstrap-ответ не является HTML")
+
+                # The bootstrap document is static as well; it only supplies the
+                # source-confirmed parity needed to construct the canonical URL.
                 parity = _extract_parity(page)
-                # Select the exact option once on the bootstrap page so Select2 and
-                # diagnostics observe the same user-facing choice before navigation.
-                _select_group(page, group, timeout_ms, target_statuses=target_statuses)
                 canonical_url = _canonical_url(url, target, group, parity)
                 capture_metadata.update({
                     "parity": parity,
-                    "selected_group": group,
-                    "selected_date": target.isoformat(),
                     "requested_canonical_url": canonical_url,
                 })
                 try:
                     canonical_response = page.goto(canonical_url, wait_until="domcontentloaded", timeout=timeout_ms)
                 except PlaywrightTimeoutError as exc:
                     raise SourceUnavailable("Сетевой тайм-аут при открытии канонического URL расписания") from exc
+                content_type = canonical_response.headers.get("content-type", "") if canonical_response else ""
                 capture_metadata.update({
                     "final_url": page.url,
                     "http_status": canonical_response.status if canonical_response is not None else None,
-                    "content_type": canonical_response.headers.get("content-type", "") if canonical_response is not None else "",
+                    "content_type": content_type,
                     "redirect_chain": _redirect_chain(canonical_response) if canonical_response is not None else [],
                 })
                 if canonical_response is None or canonical_response.status != 200:
                     status = canonical_response.status if canonical_response is not None else "no-response"
                     raise SourceUnavailable(f"Канонический URL расписания вернул HTTP {status}")
-                if "text/html" not in capture_metadata["content_type"].casefold():
+                if "text/html" not in content_type.casefold():
                     raise SourceIntegrityError("Канонический ответ не является HTML")
                 final_segments = _validate_canonical_url(page.url, canonical_url, target, group, parity)
                 capture_metadata["normalized_final_segments"] = final_segments
+
                 state = _wait_for_canonical_state(page, target, group, parity, timeout_ms)
                 if not state.get("groupOptionExists"):
                     raise SourceIntegrityError("Официальная страница не содержит option требуемой группы")
+                if not state.get("dateHeaderMatches"):
+                    raise SourceIntegrityError("Официальная страница не подтвердила запрошенную дату")
+                if not state.get("parityMatches"):
+                    raise SourceIntegrityError("Официальная страница не подтвердила тип учебной недели")
+                if state.get("promptPresent"):
+                    raise SourceIntegrityError("Источник вернул приглашение выбрать преподавателя или группу")
                 if _looks_like_error_page(state.get("title", ""), state.get("pageText", "")):
                     raise SourceIntegrityError("Канонический URL вернул страницу ошибки")
+                if not state.get("headingPresent") or not state.get("tablePresent"):
+                    raise SourceIntegrityError("Канонический URL не содержит заголовок и таблицу расписания")
+                if not state.get("hasContent"):
+                    raise SourceIntegrityError("Источник не подтвердил занятия или официальное отсутствие занятий")
                 capture_metadata.update({
-                    "final_url": page.url,
                     "selected_group": state.get("selectedGroup", ""),
                     "selected_group_text": state.get("selectedText", ""),
+                    "date_header": state.get("todayDateText", ""),
                     "parity_text": state.get("parityText", ""),
                     "schedule_class": state.get("containerClass", ""),
                     "schedule_text": state.get("scheduleText", ""),
+                    "active_parity": state.get("activeParityText", ""),
+                    "weekday_labels": state.get("weekdays", []),
                 })
-                # Capture and parse the authoritative hidden DOM before any visual mutation.
+
+                # Freeze the authoritative server DOM.  No site JavaScript has run
+                # in this context, so this HTML is also the source for parsing.
                 fragment_before = _schedule_fragment(page)
                 table_html = fragment_before.get("tableHtml", "")
                 if not table_html or fragment_before.get("tableCount") != 1:
                     raise SourceIntegrityError("Источник не содержит ровно одну таблицу расписания")
                 table_hash = _sha256_text(table_html)
+                frozen_html = page.content()
+                source_hash = _sha256_text(frozen_html)
                 fragment_before["htmlSha256"] = table_hash
                 capture_metadata.update({
                     "schedule_class": fragment_before.get("containerClass", ""),
@@ -688,126 +706,57 @@ def _capture_live_once(
                     "lesson_name_count": fragment_before.get("lessonNameCount", 0),
                     "lesson_row_count": fragment_before.get("lessonRows", 0),
                     "schedule_html_sha256": table_hash,
+                    "source_html_sha256": source_hash,
                 })
-                frozen_html = page.content()
+
                 schedule = parse_schedule_html(frozen_html, target, group)
+                week = parse_week_schedule_html(frozen_html, target, group)
+                if week.get(target) != schedule:
+                    raise SourceIntegrityError("Дневной и недельный разбор snapshot расходятся")
                 if schedule.parity != parity:
                     raise SourceIntegrityError("Распарсенная чётность не совпадает с canonical URL")
-                if not schedule.lessons and not schedule.empty_confirmed:
-                    raise SourceIntegrityError("Источник не подтвердил занятия или официальное отсутствие занятий")
-
-                # STEP (C): Verify DOM consistency - check that live DOM still matches parsed state
-                target_weekday = _WEEKDAYS[target.weekday()]
-                consistency = page.evaluate(
-                    r"""
-                    ({target, weekdays}) => {
-                      const container = document.querySelector('#schedule-container');
-                      if (!container) return { valid: false, reason: 'no-container' };
-                      
-                      // Verify selected group and schedule_date still match our expectations
-                      let selectedGroup = null;
-                      let selectedDate = null;
-                      const groupSelect = document.querySelector('#gruppa');
-                      if (groupSelect && groupSelect.value) {
-                        selectedGroup = groupSelect.value;
-                      }
-                      
-                      // Find first visible row with schedule data to verify date
-                      for (const row of [...container.querySelectorAll('tr')]) {
-                        const cells = row.querySelectorAll(':scope > th, :scope > td');
-                        if (!cells.length) continue;
-                        const label = cells[0].textContent.trim().replace(/\.$/, '');
-                        if (weekdays.includes(label)) {
-                          selectedDate = label;
-                          break;
-                        }
-                      }
-                      
-                      // Check consistency: date should match target
-                      const dateMatches = selectedDate === target;
-                      return {
-                        valid: true,
-                        selectedDate,
-                        selectedGroup,
-                        dateMatches,
-                        reason: dateMatches ? 'ok' : 'date-mismatch'
-                      };
-                    }
-                    """,
-                    {"target": target_weekday, "weekdays": list(_WEEKDAYS)},
-                )
-
-                if not consistency.get("valid", False):
-                    raise ScheduleParseError(
-                        f"DOM consistency check failed: {consistency.get('reason', 'unknown')}"
+                total_lessons = sum(len(day.lessons) for day in week.values())
+                if total_lessons == 0 and len(week) != 7:
+                    raise SourceIntegrityError(
+                        "Пустая неделя не подтверждена разделами всех семи дней"
                     )
+                if fragment_before.get("lessonNameCount", 0) and fragment_before["lessonNameCount"] != total_lessons:
+                    raise SourceIntegrityError("Число lesson-name не совпадает с распознанными занятиями")
+                if fragment_before.get("lessonRows", 0) and fragment_before["lessonRows"] != total_lessons:
+                    raise SourceIntegrityError("Число строк занятий не совпадает с распознанными занятиями")
+                capture_metadata.update({
+                    "week_days": [day.isoformat() for day in sorted(week)],
+                    "week_lesson_count": total_lessons,
+                    "selected_day_lesson_count": len(schedule.lessons),
+                    "empty_confirmed": schedule.empty_confirmed,
+                })
 
-                if not consistency.get("dateMatches", False):
-                    raise ScheduleParseError(
-                        f"DOM consistency mismatch: frozen date {target_weekday} "
-                        f"but live date is {consistency.get('selectedDate')}"
-                    )
-
-                # Reveal only presentation styles; the table markup must remain byte-identical.
+                # Only presentation CSS is changed.  The table's source HTML must
+                # remain identical to the frozen snapshot used above.
+                if not page.evaluate("""() => !!document.querySelector('#schedule-container')"""):
+                    raise SourceIntegrityError("Блок расписания исчез до создания PNG")
                 _reveal_schedule(page)
                 fragment_after_reveal = _schedule_fragment(page)
-                if _sha256_text(fragment_after_reveal.get("tableHtml", "")) != table_hash:
+                after_hash = _sha256_text(fragment_after_reveal.get("tableHtml", ""))
+                capture_metadata["dom_hash_before_png"] = table_hash
+                capture_metadata["dom_hash_after_reveal"] = after_hash
+                if after_hash != table_hash:
                     raise SourceIntegrityError("HTML таблицы изменился при раскрытии блока")
                 capture_metadata.update({
                     "revealed_width": fragment_after_reveal.get("width", 0),
                     "revealed_height": fragment_after_reveal.get("height", 0),
                     "revealed_schedule_class": fragment_after_reveal.get("containerClass", ""),
+                    "revealed_display": fragment_after_reveal.get("display", ""),
+                    "revealed_visibility": fragment_after_reveal.get("visibility", ""),
                 })
                 if fragment_after_reveal.get("width", 0) < 100 or fragment_after_reveal.get("height", 0) < 50:
                     raise SourceIntegrityError("Блок расписания имеет недопустимый размер")
 
-                # Filter display (hide other days) only after the authoritative DOM was parsed.
-                found = page.evaluate(
-                    r"""
-                    ({target, weekdays}) => {
-                      const container = document.querySelector('#schedule-container');
-                      if (!container) return false;
-                      let active = null;
-                      let found = false;
-                      for (const row of [...container.querySelectorAll('tr')]) {
-                        const cells = row.querySelectorAll(':scope > th, :scope > td');
-                        if (!cells.length) continue;
-                        const label = cells[0].textContent.trim().replace(/\.$/, '');
-                        if (weekdays.includes(label)) active = label;
-                        const isHeader = [...cells].every(cell => cell.tagName === 'TH');
-                        const keep = isHeader || active === target;
-                        if (!keep) row.style.display = 'none';  // Hide instead of remove
-                        if (!isHeader && active === target) found = true;
-                      }
-                      return found;
-                    }
-                    """,
-                    {"target": target_weekday, "weekdays": list(_WEEKDAYS)},
-                )
-
-                if not found:
-                    raise ScheduleParseError("Не удалось выделить выбранный день для скриншота")
-
-                # Validate the same visible DOM that will be rendered in the PNG.
-                screenshot_html = page.evaluate(
-                    """() => {
-                        const clone = document.documentElement.cloneNode(true);
-                        clone.querySelectorAll('[style*="display: none"]').forEach(node => node.remove());
-                        return '<!doctype html>' + clone.outerHTML;
-                    }"""
-                )
-                screenshot_schedule = parse_schedule_html(screenshot_html, target, group)
-                if screenshot_schedule != schedule:
-                    raise ScheduleParseError(
-                        "DOM consistency violation: parsed data changed between frozen and screenshot"
-                    )
-
                 fd, temporary_name = tempfile.mkstemp(prefix=".schedule-", suffix=".png", dir=output.parent)
                 os.close(fd)
                 temporary_output = Path(temporary_name)
-                page.locator("#schedule-container, section.schedule-container, .schedule-container").first.screenshot(
-                    path=str(temporary_output),
-                    animations="disabled",
+                page.locator("#schedule-container").first.screenshot(
+                    path=str(temporary_output), animations="disabled"
                 )
                 image = temporary_output.read_bytes()
                 image_stats = _png_stats(image)
@@ -821,14 +770,22 @@ def _capture_live_once(
                     temporary_output.unlink()
                 if diagnostics_dir is not None and page is not None:
                     _write_diagnostics(
-                        page, diagnostics_dir, responses=responses,
-                        console_errors=console_errors, page_errors=page_errors, target_statuses=target_statuses,
-                        capture_metadata=capture_metadata, error=exc,
+                        page,
+                        diagnostics_dir,
+                        responses=responses,
+                        console_errors=console_errors,
+                        page_errors=page_errors,
+                        target_statuses=target_statuses,
+                        capture_metadata=capture_metadata,
+                        error=exc,
                     )
                     diagnostics_written = True
                 raise
             finally:
-                browser.close()
+                if context is not None:
+                    context.close()
+                if browser is not None:
+                    browser.close()
     except Exception as exc:
         # Covers failures before a page exists (for example browser launch).
         if diagnostics_dir is not None and not diagnostics_written:

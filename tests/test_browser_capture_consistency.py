@@ -69,9 +69,9 @@ def test_dom_consistency_frozen_html_parsing(tmp_path, monkeypatch):
         server.shutdown()
         thread.join()
 
-    # Verify parse was called at least twice:
-    # Once for frozen HTML, once after screenshot for verification
-    assert len(calls) >= 2, f"Expected at least 2 parse calls, got {len(calls)}"
+    # Parsing is performed once from the frozen server snapshot.  CSS reveal
+    # does not create a second, potentially divergent DOM source.
+    assert len(calls) == 1, f"Expected one frozen snapshot parse, got {len(calls)}"
 
 
 def test_dom_consistency_parse_and_screenshot_same_state(tmp_path):
@@ -135,12 +135,9 @@ def test_dom_consistency_intermediate_verification(tmp_path, monkeypatch):
         server.shutdown()
         thread.join()
 
-    # Should parse twice: frozen (has Wednesday) and screenshot (filtered, less content)
-    assert len(parse_calls) >= 2
-    # First parse should have full HTML with Wednesday
-    assert parse_calls[0]["has_wednesday"], "First parse should have full HTML"
-    # Second parse (screenshot) should be smaller or also have content
-    # The key is that both parses succeed and are consistent
+    # The only parse is the complete weekly frozen snapshot.
+    assert len(parse_calls) == 1
+    assert parse_calls[0]["has_wednesday"], "Snapshot should contain the complete week"
 
 
 def test_dom_consistency_display_none_not_remove(tmp_path):
