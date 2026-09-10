@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import struct
+import tempfile
+import time
+import zlib
 from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse, urlunsplit
+from unicodedata import normalize
 from typing import Any
+from urllib.parse import quote, unquote, urlparse, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -18,10 +24,63 @@ from .source import SOURCE_URL, build_canonical_url, build_source_url
 
 UrlBuilder = Callable[[date, str], str]
 _WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+_ERROR_MARKERS = (
+    "captcha",
+    "cloudflare",
+    "access denied",
+    "forbidden",
+    "not found",
+    "страница не найдена",
+    "ошибка сервера",
+    "авторизац",
+    "войдите",
+)
 
 
 class SourceUnavailable(RuntimeError):
     pass
+
+
+class SourceIntegrityError(ScheduleParseError):
+    """The response loaded but cannot be proven to be the requested schedule."""
+
+
+def _normalized_segment(value: str) -> str:
+    return normalize("NFC", unquote(value)).strip()
+
+
+def _url_segments(value: str) -> list[str]:
+    return [_normalized_segment(part) for part in urlsplit(value).path.split("/") if part]
+
+
+def _validate_canonical_url(
+    final_url: str,
+    requested_url: str,
+    target: date,
+    group: str,
+    parity: str,
+) -> list[str]:
+    requested = urlsplit(requested_url)
+    final = urlsplit(final_url)
+    if final.scheme != requested.scheme or final.netloc.casefold() != requested.netloc.casefold():
+        raise SourceIntegrityError("Источник перенаправил на другой адрес")
+    actual = _url_segments(final_url)
+    expected = [_normalized_segment(group), target.isoformat(), _normalized_segment(parity)]
+    if len(actual) < 3 or actual[-3:] != expected:
+        raise SourceIntegrityError("Канонический URL не подтверждает группу, дату и тип недели")
+    prefix = _url_segments(requested_url)
+    if prefix and actual[:-3] != prefix[:-3]:
+        raise SourceIntegrityError("Канонический URL имеет неподдерживаемый путь")
+    return actual
+
+
+def _looks_like_error_page(title: str, text: str) -> bool:
+    sample = f"{title}\n{text[:4000]}".casefold()
+    return any(marker in sample for marker in _ERROR_MARKERS)
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _select_metadata(page) -> list[dict[str, Any]]:
@@ -55,6 +114,20 @@ def _response_is_target_group(response, group: str) -> bool:
     return _response_mentions_group(post_data, group)
 
 
+def _redirect_chain(response) -> list[str]:
+    """Return only safe URL paths for a document redirect chain."""
+    chain: list[str] = []
+    try:
+        request = response.request
+        while request is not None and len(chain) < 20:
+            parsed = urlsplit(request.url)
+            chain.append(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")))
+            request = request.redirected_from
+    except Exception:
+        return chain
+    return list(reversed(chain))
+
+
 def _extract_parity(page) -> str:
     """Read the source's currently active week type without guessing it."""
     value = page.evaluate(
@@ -68,6 +141,7 @@ def _extract_parity(page) -> str:
           for (const node of document.querySelectorAll(
             '[aria-pressed="true"], input:checked, .active, .selected, .btn.active'
           )) add(node);
+          add(document.querySelector('#weekParity'));
           add(document.querySelector('#schedule-container h2'));
           add(document.querySelector('#todayDate'));
           for (const text of values) {
@@ -99,35 +173,60 @@ def _canonical_state(page, target: date, group: str, parity: str) -> dict[str, A
           const parts = location.pathname.split('/').filter(Boolean).slice(-3).map(decode);
           const select = document.querySelector('#gruppa');
           const selectedText = select?.selectedOptions?.[0]?.textContent?.trim() || '';
-          const body = document.body?.innerText || '';
+          const body = document.body?.textContent || '';
           const container = document.querySelector('#schedule-container');
-          const text = container?.innerText || '';
+          const text = container?.textContent || '';
+          const options = [...document.querySelectorAll('#gruppa option')];
           const dateParts = target.split('-').map(Number);
           const dateTexts = [
             target,
             `${dateParts[2]}.${dateParts[1]}.${dateParts[0]}`,
             `${String(dateParts[2]).padStart(2, '0')}.${String(dateParts[1]).padStart(2, '0')}.${dateParts[0]}`,
           ];
-          const active = [...document.querySelectorAll('[aria-pressed="true"], input:checked, .active, .selected, .btn.active')]
-            .map((node) => (node.innerText || node.textContent || '').trim().toLowerCase())
-            .find((value) => value.includes('числитель') || value.includes('знаменатель')) || '';
-          const heading = (document.querySelector('#schedule-container h2')?.innerText || '').toLowerCase();
-          const parityText = active || heading;
+          const parityFrom = (value) => {
+            const text = (value || '').trim().toLowerCase();
+            const matches = ['числитель', 'знаменатель'].filter((item) => text.includes(item));
+            return matches.length === 1 ? matches[0] : '';
+          };
+          const weekNode = document.querySelector('#weekParity');
+          const weekParity = parityFrom(weekNode?.value || weekNode?.dataset?.parity || weekNode?.textContent);
+          const activeNodes = [...document.querySelectorAll('#weekParity.active, #weekParity .active, #weekParity [aria-pressed="true"], #weekParity [data-week-parity].active, #weekParity [data-week-parity][aria-pressed="true"], [data-week-parity].active, [data-week-parity][aria-pressed="true"], button.active, [role="button"].active')];
+          const active = activeNodes.map((node) => parityFrom(node.innerText || node.textContent)).find(Boolean) || '';
+          const activeParityControlPresent = activeNodes.length > 0;
+          const todayDateText = (document.querySelector('#todayDate')?.textContent || '').trim();
+          const heading = (document.querySelector('#schedule-container h2')?.textContent || '').toLowerCase();
+          const headingPresent = !!document.querySelector('#schedule-container h1, #schedule-container h2, #schedule-container h3');
+          const parityText = [weekParity, active, parityFrom(heading), parityFrom(todayDateText)].filter(Boolean).join(' | ');
+          const dateHeaderMatches = dateTexts.some((value) => todayDateText.includes(value));
           const hasLesson = /\d{2}:\d{2}\s*[-–—]\s*\d{2}:\d{2}/.test(text);
           const explicitEmpty = /нет занятий|занятий нет/i.test(text);
+          const weekdays = [...new Set([...container?.querySelectorAll('tr') || []]
+            .map((row) => (row.textContent || '').trim())
+            .filter((value) => /(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс)\.?/i.test(value)))];
           return {
             pathParts: parts,
             selectedGroup: select?.value || '',
             selectedText,
+            groupOptionExists: options.some((option) => option.value === group || (option.textContent || '').trim() === group),
             title: document.title || '',
-            dateMatches: dateTexts.some((value) => body.includes(value) || (document.title || '').includes(value)),
-            parityMatches: parityText.includes(parity),
+            pageText: body,
+            dateMatches: dateHeaderMatches || dateTexts.some((value) => body.includes(value) || (document.title || '').includes(value)),
+            dateHeaderMatches,
+            todayDateText,
+            parityMatches: parityText.includes(parity) && (!weekNode || weekParity === parity) && (!activeParityControlPresent || active === parity),
+            weekParityText: weekParity,
+            activeParityText: active,
+            activeParityControlPresent,
             parityText,
+            headingPresent,
             promptPresent: /Выберете преподавателя или группу/i.test(body),
             containerClass: container?.className || '',
             scheduleText: text,
             containerVisible: !!container && !!(container.offsetWidth || container.offsetHeight),
+            tablePresent: !!container?.querySelector('table'),
+            weekdays,
             hasContent: hasLesson || explicitEmpty,
+            explicitEmpty,
             finalUrl: location.href
           };
         }""",
@@ -143,25 +242,39 @@ def _wait_for_canonical_state(page, target: date, group: str, parity: str, timeo
               const state = (() => {
                 const decode = (value) => { try { return decodeURIComponent(value); } catch (_) { return ''; } };
                 const parts = location.pathname.split('/').filter(Boolean).slice(-3).map(decode);
-                const select = document.querySelector('#gruppa');
-                const body = document.body?.innerText || '';
+                const body = document.body?.textContent || '';
                 const container = document.querySelector('#schedule-container');
-                const text = container?.innerText || '';
+                const table = container?.querySelector('table');
+                const text = container?.textContent || '';
+                const options = [...document.querySelectorAll('#gruppa option')];
                 const dateParts = expected.target.split('-').map(Number);
                 const dateTexts = [
                   expected.target,
                   `${dateParts[2]}.${dateParts[1]}.${dateParts[0]}`,
                   `${String(dateParts[2]).padStart(2, '0')}.${String(dateParts[1]).padStart(2, '0')}.${dateParts[0]}`,
                 ];
-                const active = [...document.querySelectorAll('[aria-pressed="true"], input:checked, .active, .selected, .btn.active')]
-                  .map((node) => (node.innerText || node.textContent || '').trim().toLowerCase())
-                  .find((value) => value.includes('числитель') || value.includes('знаменатель')) || '';
-                const heading = (document.querySelector('#schedule-container h2')?.innerText || '').toLowerCase();
-                const parityText = active || heading;
+                const parityFrom = (value) => {
+                  const text = (value || '').trim().toLowerCase();
+                  const matches = ['числитель', 'знаменатель'].filter((item) => text.includes(item));
+                  return matches.length === 1 ? matches[0] : '';
+                };
+                const weekNode = document.querySelector('#weekParity');
+                const weekParity = parityFrom(weekNode?.value || weekNode?.dataset?.parity || weekNode?.textContent);
+                const activeNodes = [...document.querySelectorAll('#weekParity.active, #weekParity .active, #weekParity [aria-pressed="true"], #weekParity [data-week-parity].active, #weekParity [data-week-parity][aria-pressed="true"], [data-week-parity].active, [data-week-parity][aria-pressed="true"], button.active, [role="button"].active')];
+                const active = activeNodes.map((node) => parityFrom(node.innerText || node.textContent)).find(Boolean) || '';
+                const heading = (document.querySelector('#schedule-container h2')?.textContent || '').toLowerCase();
+                const headingPresent = !!document.querySelector('#schedule-container h1, #schedule-container h2, #schedule-container h3');
+                const todayDateText = (document.querySelector('#todayDate')?.textContent || '').trim();
+                const parityText = [weekParity, active, parityFrom(heading), parityFrom(todayDateText)].filter(Boolean).join(' | ');
+                const dateHeaderMatches = dateTexts.some((value) => todayDateText.includes(value));
+                const parityOk = parityText.includes(expected.parity) &&
+                  (!weekNode || weekParity === expected.parity) &&
+                  (!activeNodes.length || active === expected.parity);
                 const hasContent = /\d{2}:\d{2}\s*[-–—]\s*\d{2}:\d{2}/.test(text) || /нет занятий|занятий нет/i.test(text);
                 return parts.length === 3 && parts[0] === expected.group && parts[1] === expected.target && parts[2] === expected.parity &&
-                  select?.value === expected.group && dateTexts.some((value) => body.includes(value)) && parityText.includes(expected.parity) &&
-                  !!container && !!(container.offsetWidth || container.offsetHeight) && !/Выберете преподавателя или группу/i.test(body) && hasContent;
+                  options.some((option) => option.value === expected.group || (option.textContent || '').trim() === expected.group) &&
+                  (dateHeaderMatches || dateTexts.some((value) => body.includes(value))) && parityOk &&
+                  !!container && !!table && headingPresent && !/Выберете преподавателя или группу/i.test(body) && hasContent;
               })();
               return state;
             }""",
@@ -171,6 +284,140 @@ def _wait_for_canonical_state(page, target: date, group: str, parity: str, timeo
     except PlaywrightTimeoutError as exc:
         raise ScheduleParseError("Канонический URL не подтвердил группу, дату, чётность и расписание") from exc
     return _canonical_state(page, target, group, parity)
+
+
+def _schedule_fragment(page) -> dict[str, Any]:
+    return page.evaluate(
+        r"""() => {
+          const container = document.querySelector('#schedule-container, section.schedule-container, .schedule-container');
+          const table = container?.querySelector('table');
+          const style = container ? getComputedStyle(container) : null;
+          const rows = table ? [...table.querySelectorAll('tr')] : [];
+          const allRows = container ? [...container.querySelectorAll('tr')] : [];
+          const lessons = container ? [...container.querySelectorAll('.lesson-name')] : [];
+          const text = container?.textContent || '';
+          return {
+            containerHtml: container?.outerHTML || '',
+            tableHtml: table?.outerHTML || '',
+            text,
+            containerClass: container?.className || '',
+            display: style?.display || '',
+            visibility: style?.visibility || '',
+            opacity: style?.opacity || '',
+            width: container?.getBoundingClientRect().width || 0,
+            height: container?.getBoundingClientRect().height || 0,
+            tableCount: container ? container.querySelectorAll('table').length : 0,
+            rowCount: rows.length,
+            lessonNameCount: lessons.length,
+            lessonRows: lessons.filter((node) => node.closest('tr')).length,
+            weekdays: [...new Set(allRows.map((row) => row.textContent || '').filter((value) => /(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс)\.?/i.test(value)))],
+            htmlSha256: ''
+          };
+        }"""
+    )
+
+
+def _reveal_schedule(page) -> None:
+    page.evaluate(
+        r"""() => {
+          const target = document.querySelector('#schedule-container, section.schedule-container, .schedule-container');
+          if (!target) return false;
+          let node = target;
+          while (node && node !== document.body) {
+            if (node instanceof HTMLElement) {
+              node.style.setProperty('display', 'block', 'important');
+              node.style.setProperty('visibility', 'visible', 'important');
+              node.style.setProperty('opacity', '1', 'important');
+              node.style.setProperty('max-height', 'none', 'important');
+              node.style.setProperty('height', 'auto', 'important');
+              node.style.setProperty('overflow', 'visible', 'important');
+            }
+            node = node.parentElement;
+          }
+          return true;
+        }"""
+    )
+
+
+def _png_stats(image: bytes) -> dict[str, Any]:
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not image.startswith(signature):
+        raise SourceIntegrityError("Скриншот не является PNG")
+    pos = len(signature)
+    width = height = bit_depth = color_type = None
+    idat: list[bytes] = []
+    saw_iend = False
+    while pos + 12 <= len(image):
+        length = struct.unpack(">I", image[pos : pos + 4])[0]
+        kind = image[pos + 4 : pos + 8]
+        end = pos + 12 + length
+        if end > len(image):
+            raise SourceIntegrityError("PNG повреждён")
+        payload = image[pos + 8 : pos + 8 + length]
+        crc = struct.unpack(">I", image[pos + 8 + length : end])[0]
+        if zlib.crc32(kind + payload) & 0xFFFFFFFF != crc:
+            raise SourceIntegrityError("PNG имеет неверную CRC")
+        if kind == b"IHDR":
+            if length != 13:
+                raise SourceIntegrityError("PNG имеет неверный IHDR")
+            width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
+                ">IIBBBBB", payload
+            )
+            if compression or filtering or interlace or bit_depth != 8:
+                raise SourceIntegrityError("PNG имеет неподдерживаемый формат пикселей")
+        elif kind == b"IDAT":
+            idat.append(payload)
+        elif kind == b"IEND":
+            saw_iend = end == len(image)
+            break
+        pos = end
+    if not saw_iend or width is None or height is None or not idat:
+        raise SourceIntegrityError("PNG неполный")
+    if width < 100 or height < 50:
+        raise SourceIntegrityError("Скриншот слишком мал для расписания")
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
+    if channels is None:
+        raise SourceIntegrityError("PNG имеет неподдерживаемый тип цвета")
+    try:
+        raw = zlib.decompress(b"".join(idat))
+    except zlib.error as exc:
+        raise SourceIntegrityError("PNG имеет повреждённые данные изображения") from exc
+    stride = width * channels
+    expected = height * (stride + 1)
+    if len(raw) != expected:
+        raise SourceIntegrityError("PNG имеет неверный размер данных")
+    previous = bytearray(stride)
+    nonzero = 0
+    distinct: set[bytes] = set()
+    offset = 0
+    for _ in range(height):
+        filter_type = raw[offset]
+        row = bytearray(raw[offset + 1 : offset + 1 + stride])
+        offset += stride + 1
+        for index in range(stride):
+            left = row[index - channels] if index >= channels else 0
+            up = previous[index]
+            upper_left = previous[index - channels] if index >= channels else 0
+            if filter_type == 1:
+                row[index] = (row[index] + left) & 0xFF
+            elif filter_type == 2:
+                row[index] = (row[index] + up) & 0xFF
+            elif filter_type == 3:
+                row[index] = (row[index] + ((left + up) // 2)) & 0xFF
+            elif filter_type == 4:
+                p = left + up - upper_left
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - upper_left)
+                predictor = left if pa <= pb and pa <= pc else (up if pb <= pc else upper_left)
+                row[index] = (row[index] + predictor) & 0xFF
+            elif filter_type != 0:
+                raise SourceIntegrityError("PNG имеет неизвестный фильтр")
+        previous = row
+        nonzero += sum(1 for value in row if value)
+        if len(distinct) < 8:
+            distinct.update(bytes(row[index : index + channels]) for index in range(0, stride, channels))
+    if nonzero < max(100, width * height // 1000) or len(distinct) < 2:
+        raise SourceIntegrityError("Скриншот пустой или одноцветный")
+    return {"width": width, "height": height, "nonzero_pixels": nonzero, "distinct_colors": len(distinct)}
 
 
 def _select_group(
@@ -218,50 +465,91 @@ def _select_group(
         if rendered.count() and not rendered.filter(has_text=re.compile(rf"^{re.escape(group)}$")).count():
             raise ScheduleParseError("Select2 не отобразил выбранную группу")
 
-        # Give the site's change handler time to issue its group-specific request.
-        # Static fixtures may have no AJAX at all; in that case content validation remains authoritative.
-        wait_ms = min(timeout_ms, 3_000)
-        elapsed = 0
-        while elapsed < wait_ms and not target_responses:
-            page.wait_for_timeout(100)
-            elapsed += 100
         if target_responses and any(status >= 400 for status in target_responses):
             raise SourceUnavailable(f"Целевой запрос группы {group} вернул HTTP {target_responses[-1]}")
     finally:
         page.remove_listener("response", on_response)
 
 
-def _wait_for_schedule_state(page, target: date, group: str, timeout_ms: int) -> None:
-    page.wait_for_function("""({target, group}) => {
-      const body = document.body?.innerText || '';
-      const container = document.querySelector('#schedule-container');
-      const selected = [...document.querySelectorAll('select option:checked')].some(o => o.textContent.trim() === group);
-      const prompt = /Выберете преподавателя или группу/i.test(body);
-      const content = container?.innerText || '';
-      const lesson = /\\b\\d{2}:\\d{2}\\s*[-–—]\\s*\\d{2}:\\d{2}\\b/.test(content);
-      const empty = /нет занятий|занятий нет/i.test(content);
-      return selected && !prompt && !!container && !!(container.offsetWidth || container.offsetHeight) && (lesson || empty) && body.includes(target);
-    }""", arg={"target": target.strftime("%d.%m.%Y"), "group": group}, timeout=timeout_ms)
-
-
-def _write_diagnostics(page, directory: Path, *, responses: list[dict[str, Any]], console_errors: list[str], page_errors: list[str], target_statuses: list[int] | None = None, capture_metadata: dict[str, Any] | None = None) -> None:
+def _write_diagnostics(
+    page,
+    directory: Path,
+    *,
+    responses: list[dict[str, Any]],
+    console_errors: list[str],
+    page_errors: list[str],
+    target_statuses: list[int] | None = None,
+    capture_metadata: dict[str, Any] | None = None,
+    error: BaseException | None = None,
+) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    try: page.screenshot(path=str(directory / "page.png"), full_page=True)
-    except Exception: pass
-    try: (directory / "page.html").write_text(page.content(), encoding="utf-8")
-    except Exception: pass
     try:
-        container = page.locator("#schedule-container")
-        meta = {"url": page.url, "title": page.title(), "selects": _select_metadata(page), "page_text": page.locator("body").inner_text(timeout=1000) if page.locator("body").count() else "",
-            "schedule_text": container.inner_text(timeout=1000) if container.count() else "", "schedule_class": container.get_attribute("class") if container.count() else "",
-            "responses": responses[-100:], "console_errors": console_errors[-100:], "page_errors": page_errors[-100:], "target_group_http_statuses": (target_statuses or [])[-20:]}
+        page.screenshot(path=str(directory / "page.png"), full_page=True)
+    except Exception:
+        pass
+    try:
+        page.locator("#schedule-container, section.schedule-container, .schedule-container").first.screenshot(
+            path=str(directory / "schedule-container.png"), animations="disabled"
+        )
+    except Exception:
+        pass
+    try:
+        (directory / "page.html").write_text(page.content(), encoding="utf-8")
+    except Exception:
+        pass
+
+    # Keep each diagnostic field independent: a broken selector must not prevent
+    # metadata.json from being written for the failed browser attempt.
+    def safe_page_value(factory, default):
+        try:
+            return factory()
+        except Exception:
+            return default
+
+    selects = safe_page_value(lambda: _select_metadata(page), [])
+    page_text = safe_page_value(
+        lambda: page.locator("body").text_content(timeout=1000)
+        if page.locator("body").count()
+        else "",
+        "",
+    )
+    title = safe_page_value(page.title, "")
+    url = safe_page_value(lambda: page.url, "")
+    fragment = safe_page_value(lambda: _schedule_fragment(page), {})
+    if fragment.get("tableHtml"):
+        fragment["htmlSha256"] = _sha256_text(fragment["tableHtml"])
+    meta: dict[str, Any] = {
+        "url": url,
+        "title": title,
+        "selects": selects,
+        "page_text": page_text,
+        "schedule_text": fragment.get("text", ""),
+        "schedule_class": fragment.get("containerClass", ""),
+        "schedule_fragment": fragment,
+        "responses": responses[-100:],
+        "console_errors": console_errors[-100:],
+        "page_errors": page_errors[-100:],
+        "target_group_http_statuses": (target_statuses or [])[-20:],
+    }
+    if error is not None:
+        meta["error"] = type(error).__name__
+    try:
         if capture_metadata:
             meta.update(capture_metadata)
-        (directory / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception: pass
+    except Exception:
+        # capture_metadata is diagnostic-only; never let an unserialisable value
+        # suppress the basic page/select/network record.
+        meta["capture_metadata_error"] = True
+    try:
+        (directory / "metadata.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
+    except Exception:
+        # The directory is still intentionally left in place for upload-artifact.
+        pass
 
 
-def capture_live(
+def _capture_live_once(
     target: date,
     group: str,
     output: Path,
@@ -287,7 +575,14 @@ def capture_live(
     target_statuses: list[int] = []
     console_errors: list[str] = []
     page_errors: list[str] = []
-    capture_metadata: dict[str, Any] = {"requested_url": url, "final_url": ""}
+    capture_metadata: dict[str, Any] = {
+        "requested_bootstrap_url": url,
+        "requested_url": url,
+        "requested_strategy": "canonical",
+        "final_url": "",
+    }
+    temporary_output: Path | None = None
+    diagnostics_written = False
     try:
         with sync_playwright() as playwright:
             browser_options: dict[str, Any] = {}
@@ -304,7 +599,24 @@ def capture_live(
                 page = context.new_page()
                 page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
                 page.on("pageerror", lambda exc: page_errors.append(str(exc)))
-                page.on("response", lambda response: responses.append({"url": response.url.split("?")[0], "status": response.status}) if response.request.resource_type in {"document", "xhr", "fetch"} else None)
+
+                def record_response(response) -> None:
+                    try:
+                        resource_type = response.request.resource_type
+                    except Exception:
+                        return
+                    if resource_type not in {"document", "xhr", "fetch"}:
+                        return
+                    parsed = urlsplit(response.url)
+                    responses.append(
+                        {
+                            "url": urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")),
+                            "status": response.status,
+                            "resource_type": resource_type,
+                        }
+                    )
+
+                page.on("response", record_response)
                 try:
                     response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 except PlaywrightTimeoutError as exc:
@@ -316,6 +628,8 @@ def capture_live(
                     "bootstrap_http_status": response.status,
                     "bootstrap_content_type": response.headers.get("content-type", ""),
                 })
+                if "text/html" not in response.headers.get("content-type", "").casefold():
+                    raise SourceIntegrityError("Bootstrap-ответ не является HTML")
                 parity = _extract_parity(page)
                 # Select the exact option once on the bootstrap page so Select2 and
                 # diagnostics observe the same user-facing choice before navigation.
@@ -335,55 +649,52 @@ def capture_live(
                     "final_url": page.url,
                     "http_status": canonical_response.status if canonical_response is not None else None,
                     "content_type": canonical_response.headers.get("content-type", "") if canonical_response is not None else "",
+                    "redirect_chain": _redirect_chain(canonical_response) if canonical_response is not None else [],
                 })
                 if canonical_response is None or canonical_response.status != 200:
                     status = canonical_response.status if canonical_response is not None else "no-response"
                     raise SourceUnavailable(f"Канонический URL расписания вернул HTTP {status}")
-                state = _canonical_state(page, target, group, parity)
-                if state.get("selectedGroup") != group:
-                    raise ScheduleParseError("Канонический URL не выбрал требуемую группу")
-                _wait_for_canonical_state(page, target, group, parity, timeout_ms)
+                if "text/html" not in capture_metadata["content_type"].casefold():
+                    raise SourceIntegrityError("Канонический ответ не является HTML")
+                final_segments = _validate_canonical_url(page.url, canonical_url, target, group, parity)
+                capture_metadata["normalized_final_segments"] = final_segments
+                state = _wait_for_canonical_state(page, target, group, parity, timeout_ms)
+                if not state.get("groupOptionExists"):
+                    raise SourceIntegrityError("Официальная страница не содержит option требуемой группы")
+                if _looks_like_error_page(state.get("title", ""), state.get("pageText", "")):
+                    raise SourceIntegrityError("Канонический URL вернул страницу ошибки")
                 capture_metadata.update({
                     "final_url": page.url,
-                    "selected_group": state.get("selectedGroup") or group,
+                    "selected_group": state.get("selectedGroup", ""),
                     "selected_group_text": state.get("selectedText", ""),
                     "parity_text": state.get("parityText", ""),
                     "schedule_class": state.get("containerClass", ""),
                     "schedule_text": state.get("scheduleText", ""),
                 })
-                try:
-                    state = _canonical_state(page, target, group, parity)
-                    capture_metadata.update({
-                        "final_url": state.get("finalUrl", page.url),
-                        "selected_group": state.get("selectedGroup", ""),
-                        "selected_group_text": state.get("selectedText", ""),
-                        "parity_text": state.get("parityText", ""),
-                        "schedule_class": state.get("containerClass", ""),
-                        "schedule_text": state.get("scheduleText", ""),
-                    })
-                except Exception:
-                    pass
-
-                # STEP (A): Freeze document before any mutations
-                frozen = page.evaluate(
-                    r"""
-                    () => {
-                      window.stop();
-                      const current = document.documentElement;
-                      if (!current) return false;
-                      const clone = current.cloneNode(true);
-                      clone.querySelectorAll('script').forEach(script => script.remove());
-                      current.replaceWith(clone);
-                      return true;
-                    }
-                    """
-                )
-                if not frozen:
-                    raise ScheduleParseError("Не удалось заморозить документ источника")
-
-                # STEP (B): Parse frozen HTML (immutable snapshot)
+                # Capture and parse the authoritative hidden DOM before any visual mutation.
+                fragment_before = _schedule_fragment(page)
+                table_html = fragment_before.get("tableHtml", "")
+                if not table_html or fragment_before.get("tableCount") != 1:
+                    raise SourceIntegrityError("Источник не содержит ровно одну таблицу расписания")
+                table_hash = _sha256_text(table_html)
+                fragment_before["htmlSha256"] = table_hash
+                capture_metadata.update({
+                    "schedule_class": fragment_before.get("containerClass", ""),
+                    "schedule_display": fragment_before.get("display", ""),
+                    "schedule_visibility": fragment_before.get("visibility", ""),
+                    "schedule_opacity": fragment_before.get("opacity", ""),
+                    "table_count": fragment_before.get("tableCount", 0),
+                    "row_count": fragment_before.get("rowCount", 0),
+                    "lesson_name_count": fragment_before.get("lessonNameCount", 0),
+                    "lesson_row_count": fragment_before.get("lessonRows", 0),
+                    "schedule_html_sha256": table_hash,
+                })
                 frozen_html = page.content()
                 schedule = parse_schedule_html(frozen_html, target, group)
+                if schedule.parity != parity:
+                    raise SourceIntegrityError("Распарсенная чётность не совпадает с canonical URL")
+                if not schedule.lessons and not schedule.empty_confirmed:
+                    raise SourceIntegrityError("Источник не подтвердил занятия или официальное отсутствие занятий")
 
                 # STEP (C): Verify DOM consistency - check that live DOM still matches parsed state
                 target_weekday = _WEEKDAYS[target.weekday()]
@@ -405,7 +716,7 @@ def capture_live(
                       for (const row of [...container.querySelectorAll('tr')]) {
                         const cells = row.querySelectorAll(':scope > th, :scope > td');
                         if (!cells.length) continue;
-                        const label = cells[0].innerText.trim().replace(/\.$/, '');
+                        const label = cells[0].textContent.trim().replace(/\.$/, '');
                         if (weekdays.includes(label)) {
                           selectedDate = label;
                           break;
@@ -437,7 +748,20 @@ def capture_live(
                         f"but live date is {consistency.get('selectedDate')}"
                     )
 
-                # STEP (D): Filter display (hide other days) and take screenshot
+                # Reveal only presentation styles; the table markup must remain byte-identical.
+                _reveal_schedule(page)
+                fragment_after_reveal = _schedule_fragment(page)
+                if _sha256_text(fragment_after_reveal.get("tableHtml", "")) != table_hash:
+                    raise SourceIntegrityError("HTML таблицы изменился при раскрытии блока")
+                capture_metadata.update({
+                    "revealed_width": fragment_after_reveal.get("width", 0),
+                    "revealed_height": fragment_after_reveal.get("height", 0),
+                    "revealed_schedule_class": fragment_after_reveal.get("containerClass", ""),
+                })
+                if fragment_after_reveal.get("width", 0) < 100 or fragment_after_reveal.get("height", 0) < 50:
+                    raise SourceIntegrityError("Блок расписания имеет недопустимый размер")
+
+                # Filter display (hide other days) only after the authoritative DOM was parsed.
                 found = page.evaluate(
                     r"""
                     ({target, weekdays}) => {
@@ -448,7 +772,7 @@ def capture_live(
                       for (const row of [...container.querySelectorAll('tr')]) {
                         const cells = row.querySelectorAll(':scope > th, :scope > td');
                         if (!cells.length) continue;
-                        const label = cells[0].innerText.trim().replace(/\.$/, '');
+                        const label = cells[0].textContent.trim().replace(/\.$/, '');
                         if (weekdays.includes(label)) active = label;
                         const isHeader = [...cells].every(cell => cell.tagName === 'TH');
                         const keep = isHeader || active === target;
@@ -478,33 +802,41 @@ def capture_live(
                         "DOM consistency violation: parsed data changed between frozen and screenshot"
                     )
 
-                page.locator("#schedule-container").screenshot(
-                    path=str(output),
+                fd, temporary_name = tempfile.mkstemp(prefix=".schedule-", suffix=".png", dir=output.parent)
+                os.close(fd)
+                temporary_output = Path(temporary_name)
+                page.locator("#schedule-container, section.schedule-container, .schedule-container").first.screenshot(
+                    path=str(temporary_output),
                     animations="disabled",
                 )
-                if not output.is_file() or output.stat().st_size == 0:
-                    raise SourceUnavailable("Пустой скриншот источника")
+                image = temporary_output.read_bytes()
+                image_stats = _png_stats(image)
+                capture_metadata.update({"png_sha256": hashlib.sha256(image).hexdigest(), "png_stats": image_stats})
+                os.replace(temporary_output, output)
 
                 checked_at = datetime.now(ZoneInfo("Europe/Moscow"))
                 return schedule, checked_at
-            except Exception:
+            except Exception as exc:
+                if temporary_output is not None and temporary_output.exists():
+                    temporary_output.unlink()
                 if diagnostics_dir is not None and page is not None:
                     _write_diagnostics(
                         page, diagnostics_dir, responses=responses,
                         console_errors=console_errors, page_errors=page_errors, target_statuses=target_statuses,
-                        capture_metadata=capture_metadata,
+                        capture_metadata=capture_metadata, error=exc,
                     )
+                    diagnostics_written = True
                 raise
             finally:
                 browser.close()
     except Exception as exc:
         # Covers failures before a page exists (for example browser launch).
-        if diagnostics_dir is not None:
+        if diagnostics_dir is not None and not diagnostics_written:
             if page is not None:
                 _write_diagnostics(
                     page, diagnostics_dir, responses=responses,
                     console_errors=console_errors, page_errors=page_errors,
-                    target_statuses=target_statuses, capture_metadata=capture_metadata,
+                    target_statuses=target_statuses, capture_metadata=capture_metadata, error=exc,
                 )
             else:
                 diagnostics_dir.mkdir(parents=True, exist_ok=True)
@@ -520,3 +852,42 @@ def capture_live(
                     }, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
         raise
+
+
+def _is_retryable_capture_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return True
+    if not isinstance(exc, SourceUnavailable):
+        return False
+    message = str(exc).casefold()
+    if any(marker in message for marker in ("403", "400", "401", "404", "целевой запрос", "не является html")):
+        return False
+    return any(marker in message for marker in ("тайм-аут", "timeout", "429", "http 5", "connection", "reset", "no-response"))
+
+
+def capture_live(
+    target: date,
+    group: str,
+    output: Path,
+    *,
+    url_builder: UrlBuilder = build_source_url,
+    timeout_ms: int = 35_000,
+) -> tuple[DaySchedule, datetime]:
+    """Capture at most three times for transient network failures only."""
+    last_error: BaseException | None = None
+    for attempt in range(3):
+        try:
+            return _capture_live_once(
+                target,
+                group,
+                output,
+                url_builder=url_builder,
+                timeout_ms=timeout_ms,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 2 or not _is_retryable_capture_error(exc):
+                raise
+            time.sleep(0.25 * (2**attempt))
+    assert last_error is not None
+    raise last_error

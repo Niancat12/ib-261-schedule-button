@@ -42,7 +42,7 @@ _WEEKDAYS = {
     6: "Вс",
 }
 _TIME_RE = re.compile(r"^(\d{2}:\d{2})\s*[-–—]\s*(\d{2}:\d{2})$")
-_DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+_DATE_RE = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
 
 
 def _clean(value: str) -> str:
@@ -63,7 +63,15 @@ def _selected_group(tree) -> str | None:
     if selected:
         return _clean(" ".join(selected[0].itertext()))
     values = tree.xpath("//select[@id='gruppa']/@value")
-    return _clean(values[0]) if values and _clean(values[0]) else None
+    if values and _clean(values[0]):
+        return _clean(values[0])
+    return None
+
+
+def _group_option_exists(tree, group: str) -> bool:
+    values = tree.xpath("//select[@id='gruppa']/option/@value")
+    texts = [" ".join(option.itertext()) for option in tree.xpath("//select[@id='gruppa']/option")]
+    return group in {_clean(value) for value in values} or group in {_clean(value) for value in texts}
 
 
 def _source_date(tree) -> date:
@@ -77,7 +85,12 @@ def _source_date(tree) -> date:
 
 
 def _parity(tree) -> str:
-    text = _clean(" ".join(tree.xpath("//*[@id='schedule-container']//h2//text()"))).lower()
+    nodes = tree.xpath(
+        "//*[@id='weekParity']//text() | //*[@id='schedule-container']//h1//text() | "
+        "//*[@id='schedule-container']//h2//text() | "
+        "//*[contains(concat(' ', normalize-space(@class), ' '), ' active ')]//text()"
+    )
+    text = _clean(" ".join(nodes)).lower()
     for value in ("числитель", "знаменатель"):
         if value in text:
             return value
@@ -93,21 +106,52 @@ def _lesson_from_cells(cells: list) -> Lesson | None:
     if not cells:
         return None
     cell_text = [_clean(" ".join(cell.itertext())) for cell in cells]
-    time_match = _TIME_RE.match(cell_text[0])
+    time_match = next((_TIME_RE.search(value) for value in cell_text), None)
     if not time_match:
         return None
 
     time_text = f"{time_match.group(1)}–{time_match.group(2)}"
-    room_text = (
-        re.sub(r"^Ауд\.\s*", "", cell_text[1], flags=re.IGNORECASE).strip()
-        if len(cells) > 1
-        else ""
+    lesson_nodes = []
+    for cell in cells:
+        lesson_nodes.extend(
+            cell.xpath(
+                ".//*[contains(concat(' ', normalize-space(@class), ' '), ' lesson-name ')]"
+            )
+        )
+    room_nodes = []
+    subgroup_nodes = []
+    type_nodes = []
+    teacher_nodes = []
+    for cell in cells:
+        room_nodes.extend(
+            cell.xpath(
+                ".//*[contains(@class, 'room') or contains(@class, 'aud') or contains(@class, 'cabinet')]"
+            )
+        )
+        subgroup_nodes.extend(
+            cell.xpath(
+                ".//*[contains(@class, 'subgroup') or contains(@class, 'podgroup') or contains(@class, 'group')]"
+            )
+        )
+        type_nodes.extend(
+            cell.xpath(".//*[contains(@class, 'lesson-type') or contains(@class, 'type-zanyatiya')]")
+        )
+        teacher_nodes.extend(
+            cell.xpath(".//*[contains(@class, 'teacher') or contains(@class, 'prepod')]")
+        )
+    fallback_room = next(
+        (value for value in cell_text if re.search(r"(?:Ауд\.|ауд\.|каб\.)", value)),
+        cell_text[1] if len(cell_text) > 1 else "",
     )
-    subgroup = cell_text[2].strip() if len(cells) > 2 else ""
-    details = cells[3] if len(cells) > 3 else cells[-1]
+    room_text = _clean(" ".join(room_nodes[0].itertext())) if room_nodes else fallback_room
+    room_text = re.sub(r"^(?:Ауд\.|ауд\.|каб\.)\s*", "", room_text).strip()
+    subgroup = _clean(" ".join(subgroup_nodes[0].itertext())) if subgroup_nodes else (cell_text[2].strip() if len(cells) > 2 else "")
+    details = lesson_nodes[0] if lesson_nodes else (cells[3] if len(cells) > 3 else cells[-1])
     detail_lines = _lines(details)
-    subjects = details.xpath(".//b//text() | .//strong//text()")
-    subject = _clean(" ".join(subjects))
+    subject = _clean(" ".join(details.itertext())) if lesson_nodes else ""
+    if not subject:
+        subjects = details.xpath(".//b//text() | .//strong//text()")
+        subject = _clean(" ".join(subjects))
     if not subject:
         raise ScheduleParseError("Не удалось определить предмет в строке занятия")
 
@@ -115,8 +159,14 @@ def _lesson_from_cells(cells: list) -> Lesson | None:
     remaining = [
         line for line in detail_lines if line != subject and "отмен" not in line.casefold()
     ]
-    lesson_type = remaining[0] if remaining else None
-    teacher = remaining[-1] if len(remaining) > 1 else None
+    lesson_type = (
+        _clean(" ".join(type_nodes[0].itertext())) if type_nodes else (remaining[0] if remaining else None)
+    )
+    teacher = (
+        _clean(" ".join(teacher_nodes[0].itertext()))
+        if teacher_nodes
+        else (remaining[-1] if len(remaining) > 1 else None)
+    )
     middle = tuple(remaining[1:-1]) if len(remaining) > 2 else ()
     return Lesson(
         time=time_text,
@@ -145,8 +195,10 @@ def parse_schedule_html(source_html: str, requested_date: date, group: str) -> D
         raise ScheduleParseError("Дата источника не совпадает с запрошенной")
 
     selected_group = _selected_group(tree)
-    if selected_group != group:
+    if selected_group is not None and selected_group != group:
         raise ScheduleParseError("Источник не подтвердил выбранную группу")
+    if selected_group is None and not _group_option_exists(tree, group):
+        raise ScheduleParseError("Источник не содержит требуемую группу")
 
     target_weekday = _WEEKDAYS[requested_date.weekday()]
     active_weekday: str | None = None

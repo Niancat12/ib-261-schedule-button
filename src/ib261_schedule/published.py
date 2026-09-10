@@ -169,15 +169,42 @@ def publish_snapshot(
             return False
     with tempfile.TemporaryDirectory(prefix=".publish-", dir=day_dir) as temp:
         temp_path = Path(temp)
-        (temp_path / "schedule.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        (temp_path / "schedule.png").write_bytes(image)
-        os.replace(temp_path / "schedule.json", day_dir / "schedule.json")
-        os.replace(temp_path / "schedule.png", day_dir / "schedule.png")
-    pointer = day_dir / ".latest.json.tmp"
-    pointer.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(pointer, latest)
+        staged_json = temp_path / "schedule.json"
+        staged_png = temp_path / "schedule.png"
+        staged_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        staged_png.write_bytes(image)
+
+        final_json = day_dir / "schedule.json"
+        final_png = day_dir / "schedule.png"
+        staged_pointer = temp_path / "latest.json"
+        staged_pointer.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        backups: list[tuple[Path, Path]] = []
+
+        def backup(path: Path) -> None:
+            if path.exists():
+                backup_path = temp_path / f"old-{len(backups)}"
+                os.replace(path, backup_path)
+                backups.append((backup_path, path))
+
+        try:
+            # Move the previous complete publication out of the way first. Every
+            # subsequent replace is on the same filesystem and can be rolled back.
+            backup(final_json)
+            backup(final_png)
+            backup(latest)
+            os.replace(staged_json, final_json)
+            os.replace(staged_png, final_png)
+            os.replace(staged_pointer, latest)
+        except Exception:
+            for path in (final_json, final_png, latest):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            for backup_path, original_path in reversed(backups):
+                if backup_path.exists():
+                    os.replace(backup_path, original_path)
+            raise
     return True
 
 
@@ -200,7 +227,7 @@ def publication_base_url() -> str:
     """Return the trusted GitHub raw publication root."""
     value = os.environ.get(
         "SCHEDULE_PUBLICATION_BASE_URL",
-        "https://raw.githubusercontent.com/Niancat12/ib-261-schedule-button/master/published-schedules",
+        "https://raw.githubusercontent.com/Niancat12/ib-261-schedule-button/main/published-schedules",
     ).strip().rstrip("/")
     parsed = urlparse(value)
     if parsed.scheme != "https" or parsed.hostname not in {"raw.githubusercontent.com", "github.com"} or not parsed.path:
