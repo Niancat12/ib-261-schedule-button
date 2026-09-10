@@ -521,6 +521,65 @@ def _select_group(
         page.remove_listener("response", on_response)
 
 
+def _safe_diagnostic_mkdir(directory: Path) -> bool:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _safe_diagnostic_text(directory: Path, name: str, value: str) -> None:
+    try:
+        (directory / name).write_text(value, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _safe_diagnostic_json(directory: Path, name: str, value: Any) -> None:
+    try:
+        _safe_diagnostic_text(
+            directory,
+            name,
+            json.dumps(_redact_diagnostic(value), ensure_ascii=False, indent=2, default=str),
+        )
+    except Exception:
+        pass
+
+
+def _write_minimal_diagnostics(
+    directory: Path,
+    *,
+    responses: list[dict[str, Any]],
+    console_errors: list[str],
+    page_errors: list[str],
+    target_statuses: list[int],
+    capture_metadata: dict[str, Any],
+    error: BaseException,
+) -> None:
+    """Best-effort fallback that never replaces the original capture error."""
+    if not _safe_diagnostic_mkdir(directory):
+        return
+    meta = {
+        **capture_metadata,
+        "url": capture_metadata.get("final_url", ""),
+        "title": "",
+        "selects": [],
+        "page_text": "",
+        "schedule_text": "",
+        "responses": responses[-100:],
+        "target_group_http_statuses": target_statuses[-20:],
+        "console_errors": console_errors[-100:],
+        "page_errors": page_errors[-100:],
+        "error": type(error).__name__,
+        "error_message": str(error),
+    }
+    _safe_diagnostic_json(directory, "metadata.json", meta)
+    _safe_diagnostic_json(directory, "network.json", responses[-100:])
+    _safe_diagnostic_json(directory, "console-errors.json", console_errors[-100:])
+    _safe_diagnostic_json(directory, "page-errors.json", page_errors[-100:])
+
+
 def _write_diagnostics(
     page,
     directory: Path,
@@ -532,7 +591,12 @@ def _write_diagnostics(
     capture_metadata: dict[str, Any] | None = None,
     error: BaseException | None = None,
 ) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
+    if not _safe_diagnostic_mkdir(directory):
+        return
+    try:
+        page.screenshot(path=str(directory / "full-page.png"), full_page=True)
+    except Exception:
+        pass
     try:
         page.screenshot(path=str(directory / "page.png"), full_page=True)
     except Exception:
@@ -593,13 +657,11 @@ def _write_diagnostics(
         # suppress the basic page/select/network record.
         meta["capture_metadata_error"] = True
     meta = _redact_diagnostic(meta)
-    try:
-        (directory / "metadata.json").write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
-        )
-    except Exception:
-        # The directory is still intentionally left in place for upload-artifact.
-        pass
+    meta["error_message"] = str(error) if error is not None else ""
+    _safe_diagnostic_json(directory, "metadata.json", meta)
+    _safe_diagnostic_json(directory, "network.json", responses[-100:])
+    _safe_diagnostic_json(directory, "console-errors.json", console_errors[-100:])
+    _safe_diagnostic_json(directory, "page-errors.json", page_errors[-100:])
 
 
 def _capture_live_once(
@@ -619,7 +681,7 @@ def _capture_live_once(
     """
     url = url_builder(target, group)
     output.parent.mkdir(parents=True, exist_ok=True)
-    diagnostic_env = os.environ.get("SCHEDULE_DIAGNOSTIC_DIR", "").strip()
+    diagnostic_env = os.environ.get("IB261_DIAGNOSTICS_DIR", "").strip()
     diagnostics_dir = Path(diagnostic_env) if diagnostic_env else None
     page = None
     browser = None
@@ -821,46 +883,58 @@ def _capture_live_once(
                 return schedule, checked_at
             except Exception as exc:
                 if temporary_output is not None and temporary_output.exists():
-                    temporary_output.unlink()
+                    try:
+                        temporary_output.unlink()
+                    except Exception:
+                        pass
                 if diagnostics_dir is not None and page is not None:
-                    _write_diagnostics(
-                        page,
-                        diagnostics_dir,
-                        responses=responses,
-                        console_errors=console_errors,
-                        page_errors=page_errors,
-                        target_statuses=target_statuses,
-                        capture_metadata=capture_metadata,
-                        error=exc,
-                    )
+                    try:
+                        _write_diagnostics(
+                            page,
+                            diagnostics_dir,
+                            responses=responses,
+                            console_errors=console_errors,
+                            page_errors=page_errors,
+                            target_statuses=target_statuses,
+                            capture_metadata=capture_metadata,
+                            error=exc,
+                        )
+                    except Exception:
+                        pass
                     diagnostics_written = True
                 raise
             finally:
                 if context is not None:
-                    context.close()
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
                 if browser is not None:
-                    browser.close()
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
     except Exception as exc:
         # Covers failures before a page exists (for example browser launch).
         if diagnostics_dir is not None and not diagnostics_written:
             if page is not None:
-                _write_diagnostics(
-                    page, diagnostics_dir, responses=responses,
-                    console_errors=console_errors, page_errors=page_errors,
-                    target_statuses=target_statuses, capture_metadata=capture_metadata, error=exc,
-                )
+                try:
+                    _write_diagnostics(
+                        page, diagnostics_dir, responses=responses,
+                        console_errors=console_errors, page_errors=page_errors,
+                        target_statuses=target_statuses, capture_metadata=capture_metadata, error=exc,
+                    )
+                except Exception:
+                    pass
             else:
-                diagnostics_dir.mkdir(parents=True, exist_ok=True)
-                (diagnostics_dir / "metadata.json").write_text(
-                    json.dumps({
-                        "url": "", "title": "", "selects": [], "page_text": "",
-                        "schedule_text": "", "responses": responses[-100:],
-                        "console_errors": console_errors[-100:],
-                        "page_errors": page_errors[-100:],
-                        "target_group_http_statuses": target_statuses[-20:],
-                        **capture_metadata,
-                        "error": type(exc).__name__,
-                    }, ensure_ascii=False, indent=2), encoding="utf-8"
+                _write_minimal_diagnostics(
+                    diagnostics_dir,
+                    responses=responses,
+                    console_errors=console_errors,
+                    page_errors=page_errors,
+                    target_statuses=target_statuses,
+                    capture_metadata=capture_metadata,
+                    error=exc,
                 )
         raise
 

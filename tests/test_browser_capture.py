@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Thread
 from urllib.parse import unquote
 
+import pytest
 from playwright.sync_api import Locator
 
 import ib261_schedule.browser_capture as browser_capture
@@ -146,7 +147,7 @@ def test_capture_live_uses_canonical_url_without_selecting_intermediate_groups(t
 
 def test_capture_live_writes_diagnostics_when_group_selection_fails(tmp_path: Path, monkeypatch):
     diagnostics = tmp_path / "diagnostics"
-    monkeypatch.setenv("SCHEDULE_DIAGNOSTIC_DIR", str(diagnostics))
+    monkeypatch.setenv("IB261_DIAGNOSTICS_DIR", str(diagnostics))
     monkeypatch.setattr(
         browser_capture,
         "_extract_parity",
@@ -166,14 +167,45 @@ def test_capture_live_writes_diagnostics_when_group_selection_fails(tmp_path: Pa
     finally:
         server.shutdown(); thread.join()
     assert (diagnostics / "page.png").is_file()
+    assert (diagnostics / "full-page.png").is_file()
     assert (diagnostics / "page.html").is_file()
+    assert (diagnostics / "network.json").is_file()
+    assert (diagnostics / "console-errors.json").is_file()
+    assert (diagnostics / "page-errors.json").is_file()
     metadata = (diagnostics / "metadata.json").read_text(encoding="utf-8")
     assert '"url"' in metadata and '"selects"' in metadata
+    assert "parity missing" in metadata
+
+
+def test_diagnostic_writer_failure_does_not_replace_fetch_error(tmp_path: Path, monkeypatch):
+    diagnostics = tmp_path / "diagnostics"
+    monkeypatch.setenv("IB261_DIAGNOSTICS_DIR", str(diagnostics))
+    original = browser_capture.ScheduleParseError("original fetch failure")
+    monkeypatch.setattr(browser_capture, "_extract_parity", lambda *_args: (_ for _ in ()).throw(original))
+    monkeypatch.setattr(
+        browser_capture,
+        "_write_diagnostics",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("artifact failure")),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(browser_capture.ScheduleParseError, match="original fetch failure"):
+            capture_live(
+                date(2026, 9, 8),
+                "ИБ-261",
+                tmp_path / "schedule.png",
+                url_builder=lambda *_: f"http://127.0.0.1:{server.server_port}/schedule",
+            )
+    finally:
+        server.shutdown()
+        thread.join()
 
 
 def test_capture_rejects_selected_group_when_ajax_leaves_empty_prompt(tmp_path: Path, monkeypatch):
     diagnostics = tmp_path / "diagnostics"
-    monkeypatch.setenv("SCHEDULE_DIAGNOSTIC_DIR", str(diagnostics))
+    monkeypatch.setenv("IB261_DIAGNOSTICS_DIR", str(diagnostics))
     html = """<!doctype html><html><body>
       <div id='todayDate'>Сегодня 08.09.2026, знаменатель</div>
       <select id='gruppa'><option value='ИБ-261'>ИБ-261</option></select>
