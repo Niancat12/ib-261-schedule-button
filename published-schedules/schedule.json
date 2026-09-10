@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "group": "ИБ-261",
+  "requested_date": "2026-09-10",
+  "actual_date": "2026-09-10",
+  "schedule_date": "2026-09-10",
+  "weekday": "четверг",
+  "week_type": "знаменатель",
+  "week_number": null,
+  "parity": "знаменатель",
+  "empty_schedule_confirmed": false,
+  "checked_at": "2026-09-10T23:38:02.986455+03:00",
+  "source_url": "https://cchgeu.ru/studentu/onlayn-raspisanie/",
+  "lessons": [
+    {
+      "time": "10:15–11:50",
+      "subject": "Элективные дисциплины по физической культуре и спорту",
+      "room": null,
+      "teacher": "Вялых Надежда Николаевна",
+      "subgroup": null,
+      "lesson_type": "Практические занятия",
+      "extra": [],
+      "cancelled": false
+    },
+    {
+      "time": "13:30–15:05",
+      "subject": "Математический анализ",
+      "room": "301/1",
+      "teacher": "Батаронов Игорь Леонидович",
+      "subgroup": null,
+      "lesson_type": "Лекционные занятия",
+      "extra": [],
+      "cancelled": false
+    },
+    {
+      "time": "15:15–16:50",
+      "subject": "Физика",
+      "room": "327/1",
+      "teacher": "Тураева Татьяна Леонидовна",
+      "subgroup": null,
+      "lesson_type": "Лекционные занятия",
+      "extra": [],
+      "cancelled": false
+    }
+  ],
+  "verified": true,
+  "data_sha256": "05947a18fe75bb8ee73c6c67d9becdab01ff9e0831e67c953338fa874a171966",
+  "screenshot_sha256": "12759dd500ceb1e1ccf64f133d3110050f196f171c9b29cb15c312573c1a94dc"
+}
