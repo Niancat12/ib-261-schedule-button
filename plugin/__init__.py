@@ -588,7 +588,10 @@ def register(ctx: Any) -> None:
                 query = update.callback_query
                 if query is None or query.message is None:
                     return
-                await query.answer("Получаю свежее расписание…")
+                try:
+                    await query.answer("Получаю свежее расписание…")
+                except Exception:
+                    logger.debug("schedule callback answer failed", exc_info=True)
                 chat = getattr(query.message, "chat", None)
                 chat_id = str(getattr(chat, "id", getattr(query.message, "chat_id", "")))
                 if chat_id != target_chat:
@@ -614,7 +617,7 @@ def register(ctx: Any) -> None:
                     else:
                         _start_action(key, action, callback_id)
 
-            application.add_handler(CallbackQueryHandler(_on_callback, pattern=r"^ib261:"))
+            application.add_handler(CallbackQueryHandler(_on_callback, pattern=r"^ib261:"), group=-1)
         except Exception:
             logger.exception("Unable to install schedule keyboard")
 
