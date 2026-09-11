@@ -5,6 +5,7 @@ import os
 import signal
 from contextlib import suppress
 from datetime import UTC, date, datetime
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,6 +32,10 @@ class FakeState:
 
     def set(self, key, value):
         pass
+
+
+class FakePlatform(Enum):
+    TELEGRAM = "telegram"
 
 
 class FakeContext:
@@ -94,6 +99,27 @@ def test_hook_skips_llm_and_spawns_supervised_schedule_task_for_button():
         coro.close()
     ctx.spawned.clear()
     result = ctx.hooks["pre_gateway_dispatch"](event("📅 Расписание ИБ-261"))
+    try:
+        assert result == {"action": "skip", "reason": "ib261-button"}
+        assert len(ctx.spawned) == 1
+    finally:
+        for coro in ctx.spawned:
+            coro.close()
+
+
+def test_hook_accepts_hermes_platform_enum_for_schedule_command():
+    ctx = FakeContext()
+    register(ctx)
+    ctx.factories["telegram"](SimpleNamespace(bot=SimpleNamespace()), None)
+    source = SimpleNamespace(
+        platform=FakePlatform.TELEGRAM,
+        chat_id="1000593689",
+        chat_type="dm",
+        user_id="1000593689",
+        thread_id=None,
+    )
+    event_value = SimpleNamespace(text="/schedule", source=source, user_id="1000593689")
+    result = ctx.hooks["pre_gateway_dispatch"](event_value)
     try:
         assert result == {"action": "skip", "reason": "ib261-button"}
         assert len(ctx.spawned) == 1

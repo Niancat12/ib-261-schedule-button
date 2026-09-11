@@ -565,7 +565,10 @@ def register(ctx: Any) -> None:
             )
 
     def hook(event: Any, **kwargs: Any) -> dict[str, str] | None:
-        if (_event_chat_id(event) != target_chat or getattr(getattr(event, "source", event), "platform", "telegram") != "telegram"):
+        source = getattr(event, "source", event)
+        platform = getattr(source, "platform", "telegram")
+        platform_name = getattr(platform, "value", platform)
+        if _event_chat_id(event) != target_chat or str(platform_name).casefold() != "telegram":
             return None
         text = getattr(event, "text", "")
         if text in {BUTTON, MENU_COMMAND, "Сегодня", "Завтра", "Неделя", "Обновить", "⬅️ Вчера", "➡️ Завтра", "📆 Другая дата", "📅 Другая дата", "/ib261"} or controller._awaiting_date.__contains__(_key(event)):
