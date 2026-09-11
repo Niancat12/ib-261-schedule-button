@@ -65,7 +65,7 @@ def format_schedule(schedule: DaySchedule, checked_at: datetime, *, stale: bool)
         lines.extend(("⚠️ РАНЕЕ ПОЛУЧЕННЫЕ ДАННЫЕ", "Источник сейчас недоступен.", ""))
     lines.extend(
         (
-            f"📅 ИБ-261 — {format_day_heading(day)}",
+            f"{format_day_heading(day)}, ИБ-261",
             f"Неделя: {schedule.parity}",
             "",
         )

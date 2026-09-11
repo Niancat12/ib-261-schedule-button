@@ -7,7 +7,10 @@ import json
 import logging
 import os
 import signal
+import struct
+import sys
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,7 +21,10 @@ from ib261_schedule.presentation import format_day_heading
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-WORKER_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+# Run the capture worker in the same interpreter that loaded the Hermes
+# plugin.  This prevents the gateway from silently executing a stale project
+# virtualenv while the active plugin imports a different editable checkout.
+WORKER_PYTHON = Path(sys.executable)
 CACHE_ROOT = PROJECT_ROOT / "runtime" / "cache"
 MOSCOW = ZoneInfo("Europe/Moscow")
 GROUP = "ИБ-261"
@@ -34,6 +40,34 @@ CALLBACK_TEXT = {
     "ib261:date": "📅 Другая дата",
 }
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+@dataclass(frozen=True)
+class TelegramSchedulePayload:
+    """Immutable presentation result shared by both Telegram sends."""
+
+    view_mode: str
+    requested_date: date
+    capture_id: str
+    checked_at: datetime
+    text: str
+    photo_path: Path
+    photo_bytes: bytes
+    photo_sha256: str
+    photo_width: int
+    photo_height: int
+    photo_kind: str
+    caption: str
+    keyboard: Any
+
+
+def _png_dimensions(image: bytes) -> tuple[int, int]:
+    if not image.startswith(PNG_SIGNATURE) or len(image) < 24:
+        raise ValueError("invalid PNG")
+    width, height = struct.unpack(">II", image[16:24])
+    if width <= 0 or height <= 0:
+        raise ValueError("invalid PNG dimensions")
+    return width, height
 
 
 def _moscow_date(instant: datetime | None = None) -> date:
@@ -273,6 +307,85 @@ async def _run_worker(target: date, timeout: float = 35.0, *, week: bool = False
         }
 
 
+def _build_telegram_payload(
+    payload: dict[str, Any], *, mode: str, keyboard: Any = None,
+) -> TelegramSchedulePayload:
+    screenshot = payload.get("screenshot")
+    if not screenshot:
+        raise ValueError("schedule payload has no screenshot")
+    path = Path(str(screenshot)).resolve()
+    with _open_verified_screenshot(CACHE_ROOT, path, str(payload["screenshot_sha256"])) as stream:
+        image = stream.read()
+    width, height = _png_dimensions(image)
+    requested_date = date.fromisoformat(str(payload["requested_date"]))
+    checked_at = datetime.fromisoformat(str(payload["checked_at"])).astimezone(MOSCOW)
+    parity = str(payload["parity"]).capitalize()
+    if mode == "week":
+        monday = requested_date - timedelta(days=requested_date.weekday())
+        sunday = monday + timedelta(days=6)
+        months = ("", "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
+        span = (f"{monday.day}–{sunday.day} {months[sunday.month]} {sunday.year}"
+                if monday.month == sunday.month else
+                f"{monday.day} {months[monday.month]}–{sunday.day} {months[sunday.month]} {sunday.year}")
+        caption = f"📅 ИБ-261\nНеделя: {span}\n{parity}\nПроверено: {checked_at:%H:%M:%S} МСК"
+        photo_kind = "full_week"
+    else:
+        caption = (f"📅 ИБ-261\n{format_day_heading(requested_date)}\n"
+                   f"{parity}\nПроверено: {checked_at:%H:%M:%S} МСК")
+        photo_kind = "full_week" if payload.get("crop_warning") or payload.get("status") == "stale" else "daily_crop"
+        if payload.get("crop_warning"):
+            caption += "\nНе удалось выделить день — показана вся неделя"
+    outbound = TelegramSchedulePayload(
+        view_mode=mode,
+        requested_date=requested_date,
+        capture_id=str(payload["capture_id"]),
+        checked_at=checked_at,
+        text=str(payload["text"]),
+        photo_path=path,
+        photo_bytes=image,
+        photo_sha256=hashlib.sha256(image).hexdigest(),
+        photo_width=width,
+        photo_height=height,
+        photo_kind=photo_kind,
+        caption=caption,
+        keyboard=keyboard,
+    )
+    if outbound.photo_sha256 != str(payload["screenshot_sha256"]):
+        raise ValueError("outbound photo hash mismatch")
+    if mode == "week":
+        if not outbound.text.startswith("📅 Расписание ИБ-261 на неделю"):
+            raise ValueError("weekly text is not the current formatter output")
+    else:
+        heading_lines = outbound.text.splitlines()[:5]
+        heading_parts = format_day_heading(requested_date).split(", ")
+        expected_weekday = heading_parts[1] if len(heading_parts) > 2 else heading_parts[0]
+        expected_date = f"{requested_date.day} "
+        if not any(
+            GROUP in line and expected_weekday in line and expected_date in line
+            for line in heading_lines
+        ):
+            raise ValueError("daily text is not the current formatter output")
+    return outbound
+
+
+def _safe_text_fallback(payload: dict[str, Any], target: date, mode: str) -> str:
+    """Return text only when it carries the current canonical heading."""
+    text = payload.get("text")
+    if not isinstance(text, str):
+        return "⚠️ Расписание не удалось подготовить."
+    if mode == "week":
+        valid = text.startswith("📅 Расписание ИБ-261 на неделю")
+    else:
+        heading_parts = format_day_heading(target).split(", ")
+        expected_weekday = heading_parts[1] if len(heading_parts) > 2 else heading_parts[0]
+        expected_date = f"{target.day} "
+        valid = any(
+            GROUP in line and expected_weekday in line and expected_date in line
+            for line in text.splitlines()[:5]
+        )
+    return text if valid else "⚠️ Расписание не удалось подготовить."
+
+
 async def _send_result(
     bot: Any,
     adapter: Any,
@@ -287,56 +400,57 @@ async def _send_result(
     mode: str = "day",
 ) -> None:
     photo_sent = False
-    screenshot = payload.get("screenshot")
-    if screenshot:
-        try:
-            # TelegramAdapter.send_image_file is Hermes' native media API.  It
-            # uploads the local verified bytes and falls back to a document
-            # when Telegram rejects the image dimensions.
-            sender = getattr(adapter, "send_image_file", None)
-            if not callable(sender):
-                raise ValueError("Hermes Telegram media API is unavailable")
-            with _open_verified_screenshot(
-                CACHE_ROOT, Path(screenshot), payload["screenshot_sha256"]
-            ):
-                pass
-            target_date = date.fromisoformat(str(payload["requested_date"]))
-            checked_at = datetime.fromisoformat(str(payload["checked_at"])).astimezone(MOSCOW)
-            if mode == "week":
-                monday = target_date - timedelta(days=target_date.weekday())
-                sunday = monday + timedelta(days=6)
-                months = ("", "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
-                span = (f"{monday.day}–{sunday.day} {months[sunday.month]} {sunday.year}"
-                        if monday.month == sunday.month else
-                        f"{monday.day} {months[monday.month]}–{sunday.day} {months[sunday.month]} {sunday.year}")
-                caption = (f"📅 ИБ-261\nНеделя: {span}\n{str(payload['parity']).capitalize()}\n"
-                           f"Проверено: {checked_at:%H:%M:%S} МСК")
-            else:
-                caption = (f"📅 ИБ-261\n{format_day_heading(target_date)}\n"
-                           f"{str(payload['parity']).capitalize()}\nПроверено: {checked_at:%H:%M:%S} МСК")
-                if payload.get("crop_warning"):
-                    caption += "\nНе удалось выделить день — показана вся неделя"
-            result = await sender(
-                chat_id=chat_id,
-                image_path=str(Path(screenshot)),
-                caption=caption,
-            )
-            if getattr(result, "success", True) is False:
-                raise ValueError(getattr(result, "error", "media upload failed"))
-            photo_sent = True
-        except Exception as exc:
-            # Keep diagnostics safe: adapter exceptions can contain request
-            # details, URLs, or platform metadata that must not enter logs.
-            logger.warning(
-                "Verified schedule screenshot could not be sent (%s)",
-                type(exc).__name__,
-            )
+    outbound: TelegramSchedulePayload | None = None
+    try:
+        outbound = _build_telegram_payload(payload, mode=mode, keyboard=_inline_keyboard())
+        logger.info(
+            "schedule outbound handler=_send_result view_mode=%s requested_date=%s capture_id=%s "
+            "first_line=%r photo_sha256=%s photo_size=%sx%s photo_source=%s callback_query_id=%s",
+            outbound.view_mode, outbound.requested_date.isoformat(), outbound.capture_id,
+            outbound.text.splitlines()[0] if outbound.text else "", outbound.photo_sha256,
+            outbound.photo_width, outbound.photo_height, outbound.photo_kind,
+            payload.get("callback_query_id", "-"),
+        )
+        sender = getattr(adapter, "send_image_file", None)
+        if not callable(sender):
+            raise ValueError("Hermes Telegram media API is unavailable")
+        result = await sender(
+            chat_id=chat_id,
+            image_path=str(outbound.photo_path),
+            caption=outbound.caption,
+            metadata={
+                "schedule_capture_id": outbound.capture_id,
+                "schedule_photo_sha256": outbound.photo_sha256,
+                "schedule_photo_width": outbound.photo_width,
+                "schedule_photo_height": outbound.photo_height,
+                "schedule_photo_kind": outbound.photo_kind,
+            },
+        )
+        telegram_sizes = getattr(result, "photo_sizes", None)
+        logger.info(
+            "schedule sendPhoto result success=%s capture_id=%s photo_sha256=%s photo_size=%sx%s telegram_photo_sizes=%s",
+            getattr(result, "success", True), outbound.capture_id, outbound.photo_sha256,
+            outbound.photo_width, outbound.photo_height, telegram_sizes or "unreported",
+        )
+        if getattr(result, "success", True) is False:
+            raise ValueError(getattr(result, "error", "media upload failed"))
+        photo_sent = True
+    except Exception as exc:
+        logger.warning("Verified schedule screenshot could not be sent (%s)", type(exc).__name__)
     if not photo_sent:
         await bot.send_message(chat_id=chat_id, text="Не удалось загрузить изображение расписания")
+    if outbound is None:
+        # Keep text delivery available when media validation fails.
+        text = _safe_text_fallback(payload, target, mode)
+        keyboard = _inline_keyboard()
+    else:
+        text, keyboard = outbound.text, outbound.keyboard
+        logger.info(
+            "schedule sendMessage capture_id=%s first_line=%r photo_sha256=%s",
+            outbound.capture_id, text.splitlines()[0] if text else "", outbound.photo_sha256,
+        )
     await bot.send_message(
-        chat_id=chat_id,
-        text=payload["text"],
-        reply_markup=_inline_keyboard(),
+        chat_id=chat_id, text=text, reply_markup=keyboard,
     )
     if gate.is_current(key, token):
         controller.mark_displayed(key, target, mode)
@@ -409,12 +523,12 @@ def register(ctx: Any) -> None:
         task = asyncio.create_task(_deliver(key, action, token))
         gate.attach(key, token, task)
 
-    def _start_action(key: tuple[str, str, str | None], action: Action) -> None:
+    def _start_action(key: tuple[str, str, str | None], action: Action, callback_query_id: str = "") -> None:
         token = gate.begin(key, cancel_previous=False)
-        task = asyncio.create_task(_deliver(key, action, token))
+        task = asyncio.create_task(_deliver(key, action, token, callback_query_id))
         gate.attach(key, token, task)
 
-    async def _deliver(key: tuple[str, str, str | None], action: Action, token: int) -> None:
+    async def _deliver(key: tuple[str, str, str | None], action: Action, token: int, callback_query_id: str = "") -> None:
         target = action.target or _moscow_date()
         bot = bots.get(key[1])
         if action.kind == "week" or action.mode == "week":
@@ -426,6 +540,7 @@ def register(ctx: Any) -> None:
             except ValueError:
                 return
             if gate.is_current(key, token):
+                payload["callback_query_id"] = callback_query_id
                 await _send_result(bot, adapters.get(key[1]), payload, target, key, controller, token, gate, mode="week")
             if gate.is_current(key, token):
                 controller.mark_displayed(key, target, "week")
@@ -436,6 +551,7 @@ def register(ctx: Any) -> None:
         except ValueError:
             return
         if bot and gate.is_current(key, token):
+            payload["callback_query_id"] = callback_query_id
             await _send_result(
                 bot,
                 adapters.get(key[1]),
@@ -491,7 +607,7 @@ def register(ctx: Any) -> None:
                             text="Введите дату в формате ДД.ММ.ГГГГ или ГГГГ-ММ-ДД",
                         )
                     else:
-                        _start_action(key, action)
+                        _start_action(key, action, callback_id)
 
             application.add_handler(CallbackQueryHandler(_on_callback, pattern=r"^ib261:"))
         except Exception:

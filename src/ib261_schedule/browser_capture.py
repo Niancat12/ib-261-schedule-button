@@ -917,23 +917,33 @@ def _capture_live_once(
                           if (!table) return null;
                           const labels = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
                           const rows = [...table.querySelectorAll('tr')];
-                          const found = [];
+                          const headings = [];
                           for (let i = 0; i < rows.length; i++) {
                             const cells = [...rows[i].children];
-                            const text = (cells[0]?.textContent || '').replace(/\\s+/g,' ').trim();
-                            if (text === label || text.startsWith(label + '.')) found.push(i);
+                            const text = cells
+                              .map(cell => (cell.textContent || '').replace(/\\s+/g,' ').trim())
+                              .find(value => labels.some(day => value === day || value.startsWith(day + '.')));
+                            if (text) {
+                              const day = labels.find(value => text === value || text.startsWith(value + '.'));
+                              headings.push({index: i, day});
+                            }
                           }
-                          if (!found.length) return null;
-                          const start = found[0];
-                          const next = found.slice(1).find(i => i > start);
-                          const end = next === undefined ? rows.length : next;
+                          const current = headings.find(item => item.day === label);
+                          if (!current) return null;
+                          const start = current.index;
+                          const next = headings.find(item => item.index > start && item.day !== label);
+                          const end = next === undefined ? rows.length : next.index;
                           const chosen = rows.slice(start, end).map(r => r.getBoundingClientRect()).filter(r => r.width && r.height);
                           const box = table.getBoundingClientRect();
-                          const rootBox = root.getBoundingClientRect();
                           if (!chosen.length || !box.width || !box.height) return null;
                           const top = Math.max(box.top, Math.min(...chosen.map(r => r.top)) - 4);
                           const bottom = Math.min(box.bottom, Math.max(...chosen.map(r => r.bottom)) + 4);
-                          return {x: box.left-rootBox.left, y: top-rootBox.top, width: box.width, height: bottom-top};
+                          // page.screenshot() expects viewport coordinates.  The
+                          // row geometry is measured relative to the schedule
+                          // root so add the root's viewport offset here.  Using
+                          // root-relative y directly can select the following
+                          // day when the root is not flush with the viewport.
+                          return {x: box.left, y: top, width: box.width, height: bottom-top};
                         }""",
                         label,
                     )
