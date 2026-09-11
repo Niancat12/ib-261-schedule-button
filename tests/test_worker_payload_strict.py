@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -95,7 +96,7 @@ class TestWorkerExitCode:
         """Test that worker exits with non-zero on invalid date."""
         result = subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "ib261_schedule.worker",
                 "--date",
@@ -114,7 +115,7 @@ class TestWorkerExitCode:
         """Test that worker always outputs valid JSON."""
         result = subprocess.run(
             [
-                "python",
+                sys.executable,
                 "-m",
                 "ib261_schedule.worker",
                 "--date",

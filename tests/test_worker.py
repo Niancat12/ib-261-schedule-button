@@ -20,6 +20,12 @@ EXPECTED_KEYS = {
     "cache_version",
     "screenshot",
     "screenshot_sha256",
+    "parity",
+    "capture_id",
+    "checked_at",
+    "source_url",
+    "json_sha256",
+    "crop_warning",
 }
 
 
@@ -46,6 +52,9 @@ def test_worker_payload_fresh_has_strict_identity_and_photo_schema(tmp_path: Pat
     assert payload["cache_version"] == "version-1"
     assert payload["screenshot"] == str(photo)
     assert payload["screenshot_sha256"] == hashlib.sha256(b"png").hexdigest()
+    assert payload["parity"] == "знаменатель"
+    assert payload["capture_id"] == "version-1"
+    assert payload["checked_at"] == CHECKED.isoformat()
     assert "РАНЕЕ ПОЛУЧЕННЫЕ" not in payload["text"]
 
 
@@ -69,6 +78,10 @@ def test_worker_payload_unavailable_forbids_photo_and_cache_identity():
     assert payload["cache_version"] is None
     assert payload["screenshot"] is None
     assert payload["screenshot_sha256"] is None
+    assert payload["parity"] is None
+    assert payload["capture_id"] is None
+    assert payload["json_sha256"] is None
+    assert payload["crop_warning"] is False
     assert "Источник расписания сейчас недоступен" in payload["text"]
     assert "https://cchgeu.ru/studentu/onlayn-raspisanie/" in payload["text"]
 
@@ -85,3 +98,22 @@ def test_worker_payload_rejects_mismatched_requested_identity(tmp_path: Path):
     photo.write_bytes(b"png")
     with pytest.raises(ValueError, match="запрос"):
         build_payload(result_with_photo("fresh", photo), date(2026, 9, 9))
+
+
+def test_worker_uses_new_live_capture_for_each_request_before_publication_fallback(tmp_path, monkeypatch):
+    import ib261_schedule.worker as worker
+
+    calls = []
+
+    def live(target, group, output):
+        calls.append(target)
+        output.write_bytes(b"live-png")
+        return DaySchedule(group, target, "знаменатель", ()), CHECKED
+
+    monkeypatch.setattr(worker, "capture_live", live)
+    monkeypatch.setattr(worker, "load_remote_snapshot", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fallback used")))
+    first = worker.run(TARGET, tmp_path / "cache")
+    second = worker.run(TARGET, tmp_path / "cache")
+    assert calls == [TARGET, TARGET]
+    assert first["status"] == second["status"] == "fresh"
+    assert first["capture_id"] != second["capture_id"]

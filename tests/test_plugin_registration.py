@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import os
 import signal
@@ -17,6 +18,10 @@ from plugin import (
     _validate_worker_payload,
     _worker_env,
     register,
+)
+
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
 
 
@@ -119,7 +124,7 @@ def test_moscow_date_advances_at_moscow_midnight():
 
 def valid_payload(tmp_path: Path) -> dict[str, object]:
     image = tmp_path / "schedule.png"
-    image.write_bytes(b"trusted")
+    image.write_bytes(PNG_BYTES)
     return {
         "status": "fresh",
         "text": "schedule",
@@ -127,7 +132,13 @@ def valid_payload(tmp_path: Path) -> dict[str, object]:
         "group": "ИБ-261",
         "cache_version": "version-1",
         "screenshot": str(image),
-        "screenshot_sha256": hashlib.sha256(b"trusted").hexdigest(),
+        "screenshot_sha256": hashlib.sha256(PNG_BYTES).hexdigest(),
+        "parity": "знаменатель",
+        "capture_id": "version-1",
+        "checked_at": "2026-09-08T09:01:00+03:00",
+        "source_url": "https://cchgeu.ru/studentu/onlayn-raspisanie/%D0%98%D0%B1-261/2026-09-08/%D0%B7%D0%BD%D0%B0%D0%BC%D0%B5%D0%BD%D0%B0%D1%82%D0%B5%D0%BB%D1%8C",
+        "json_sha256": "payload-hash",
+        "crop_warning": False,
     }
 
 
@@ -163,6 +174,11 @@ def test_worker_payload_validator_is_dict_only_exact_and_status_aware(tmp_path: 
         "cache_version": None,
         "screenshot": None,
         "screenshot_sha256": None,
+        "parity": None,
+        "capture_id": None,
+        "checked_at": None,
+        "source_url": None,
+        "json_sha256": None,
     }
     assert _validate_worker_payload(unavailable, date(2026, 9, 8)) == unavailable
 
@@ -172,14 +188,14 @@ def test_verified_screenshot_upload_uses_trusted_fd_and_rejects_symlinks(tmp_pat
     version = root / "ИБ-261" / "2026-09-08" / "version-1"
     version.mkdir(parents=True)
     image = version / "schedule.png"
-    image.write_bytes(b"trusted")
-    digest = hashlib.sha256(b"trusted").hexdigest()
+    image.write_bytes(PNG_BYTES)
+    digest = hashlib.sha256(PNG_BYTES).hexdigest()
 
     with _open_verified_screenshot(root, image, digest) as trusted:
         moved = version / "original.png"
         image.replace(moved)
         image.symlink_to(tmp_path / "outside.png")
-        assert trusted.read() == b"trusted"
+        assert trusted.read() == PNG_BYTES
 
     with pytest.raises(ValueError), _open_verified_screenshot(root, image, digest):
         pass

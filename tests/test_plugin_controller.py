@@ -9,7 +9,8 @@ TODAY = date(2026, 9, 8)
 def test_main_button_uses_moscow_today_and_sets_anchor_only_after_display():
     controller = ButtonController()
     action = controller.handle("📅 Расписание ИБ-261", KEY, TODAY)
-    assert action.kind == "schedule"
+    assert action.kind == "week"
+    assert action.mode == "week"
     assert action.target == TODAY
     controller.mark_displayed(KEY, TODAY)
     assert controller.handle("➡️ Завтра", KEY, TODAY).target == date(2026, 9, 9)
@@ -32,6 +33,15 @@ def test_requested_date_does_not_advance_anchor_until_successfully_displayed():
     assert controller.handle("➡️ Завтра", KEY, TODAY).target == date(2026, 9, 9)
     controller.mark_displayed(KEY, chosen.target)
     assert controller.handle("➡️ Завтра", KEY, TODAY).target == date(2026, 10, 16)
+
+
+def test_refresh_preserves_week_mode():
+    controller = ButtonController()
+    controller.mark_displayed(KEY, TODAY, "week")
+    action = controller.handle("🔄 Обновить", KEY, TODAY)
+    assert action.kind == "refresh"
+    assert action.mode == "week"
+    assert action.target == TODAY
 
 
 def test_other_date_only_intercepts_the_next_validated_date():

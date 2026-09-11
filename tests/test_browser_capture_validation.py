@@ -110,19 +110,19 @@ def test_canonical_hidden_schedule_is_valid_without_selected_group(tmp_path: Pat
     assert browser_capture._png_stats(image)["distinct_colors"] > 1
 
 
-def test_transient_capture_errors_are_retried_at_most_three_times(monkeypatch, tmp_path: Path):
+def test_transient_capture_errors_are_retried_at_most_twice(monkeypatch, tmp_path: Path):
     calls = []
 
     def flaky(*_args, **_kwargs):
         calls.append(1)
-        if len(calls) < 3:
+        if len(calls) < 2:
             raise browser_capture.SourceUnavailable("официальный источник HTTP 500")
         return object(), object()
 
     monkeypatch.setattr(browser_capture, "_capture_live_once", flaky)
     result = browser_capture.capture_live(date(2026, 9, 10), "ИБ-261", tmp_path / "x.png")
     assert result[0] is not None
-    assert len(calls) == 3
+    assert len(calls) == 2
 
 
 def test_http_403_is_not_retried(monkeypatch, tmp_path: Path):
@@ -150,3 +150,14 @@ def test_diagnostics_redact_credentials_and_bearer_values():
     assert "top-secret" not in redacted
     assert "abc123" not in redacted
     assert "user:pass" not in redacted
+
+
+def test_authenticated_proxy_is_split_without_losing_encoded_credentials():
+    proxy = browser_capture._playwright_proxy(
+        "http://user%40name:p%40ss%3Aword@203.0.113.10:8080"
+    )
+    assert proxy == {
+        "server": "http://203.0.113.10:8080",
+        "username": "user@name",
+        "password": "p@ss:word",
+    }

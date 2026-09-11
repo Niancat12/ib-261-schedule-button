@@ -51,6 +51,19 @@ class SourceIntegrityError(ScheduleParseError):
     """The response loaded but cannot be proven to be the requested schedule."""
 
 
+def _playwright_proxy(value: str) -> dict[str, str]:
+    """Convert the protected proxy URL into Playwright's credential fields."""
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.port is None:
+        raise ValueError("SCHEDULE_PROXY_URL has an invalid proxy address")
+    result = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username is not None:
+        result["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        result["password"] = unquote(parsed.password)
+    return result
+
+
 def _normalized_segment(value: str) -> str:
     return normalize("NFC", unquote(value)).strip()
 
@@ -671,7 +684,9 @@ def _capture_live_once(
     *,
     url_builder: UrlBuilder = build_source_url,
     timeout_ms: int = 35_000,
-) -> tuple[DaySchedule, datetime]:
+    return_week: bool = False,
+    day_output: Path | None = None,
+) -> tuple[DaySchedule, datetime] | tuple[DaySchedule, datetime, dict[date, DaySchedule]]:
     """Capture one official, server-rendered weekly snapshot.
 
     The site JavaScript is known to reset the group select and replace a valid
@@ -707,7 +722,7 @@ def _capture_live_once(
             browser_options: dict[str, Any] = {}
             proxy = os.environ.get("SCHEDULE_PROXY_URL", "").strip()
             if proxy:
-                browser_options["proxy"] = {"server": proxy}
+                browser_options["proxy"] = _playwright_proxy(proxy)
             browser = playwright.chromium.launch(headless=True, **browser_options)
             context = browser.new_context(
                 timezone_id="Europe/Moscow",
@@ -879,7 +894,50 @@ def _capture_live_once(
                 capture_metadata.update({"png_sha256": hashlib.sha256(image).hexdigest(), "png_stats": image_stats})
                 os.replace(temporary_output, output)
 
+                if day_output is not None:
+                    # Derive the crop from actual table row geometry.  The
+                    # weekday heading starts a section; the next heading (or
+                    # the table bottom for Sunday) closes it.
+                    label = _WEEKDAYS[target.weekday()]
+                    crop = page.evaluate(
+                        """(label) => {
+                          const root = document.querySelector('#schedule-container');
+                          const table = root?.querySelector('table');
+                          if (!table) return null;
+                          const labels = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+                          const rows = [...table.querySelectorAll('tr')];
+                          const found = [];
+                          for (let i = 0; i < rows.length; i++) {
+                            const cells = [...rows[i].children];
+                            const text = (cells[0]?.textContent || '').replace(/\\s+/g,' ').trim();
+                            if (text === label || text.startsWith(label + '.')) found.push(i);
+                          }
+                          if (!found.length) return null;
+                          const start = found[0];
+                          const next = found.slice(1).find(i => i > start);
+                          const end = next === undefined ? rows.length : next;
+                          const chosen = rows.slice(start, end).map(r => r.getBoundingClientRect()).filter(r => r.width && r.height);
+                          const box = table.getBoundingClientRect();
+                          if (!chosen.length || !box.width || !box.height) return null;
+                          const top = Math.max(box.top, Math.min(...chosen.map(r => r.top)) - 4);
+                          const bottom = Math.min(box.bottom, Math.max(...chosen.map(r => r.bottom)) + 4);
+                          return {x: box.left, y: top, width: box.width, height: bottom-top};
+                        }""",
+                        label,
+                    )
+                    if crop and crop.get("width", 0) >= 100 and crop.get("height", 0) >= 30:
+                        try:
+                            day_output.parent.mkdir(parents=True, exist_ok=True)
+                            page.screenshot(path=str(day_output), clip=crop)
+                            _png_stats(day_output.read_bytes())
+                        except Exception:
+                            # The authoritative weekly capture remains valid.
+                            # Its caller will send it with an explicit crop warning.
+                            day_output.unlink(missing_ok=True)
+
                 checked_at = datetime.now(ZoneInfo("Europe/Moscow"))
+                if return_week:
+                    return schedule, checked_at, week
                 return schedule, checked_at
             except Exception as exc:
                 if temporary_output is not None and temporary_output.exists():
@@ -957,10 +1015,12 @@ def capture_live(
     *,
     url_builder: UrlBuilder = build_source_url,
     timeout_ms: int = 35_000,
-) -> tuple[DaySchedule, datetime]:
-    """Capture at most three times for transient network failures only."""
+    return_week: bool = False,
+    day_output: Path | None = None,
+) -> tuple[DaySchedule, datetime] | tuple[DaySchedule, datetime, dict[date, DaySchedule]]:
+    """Capture at most twice for transient network failures only."""
     last_error: BaseException | None = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             return _capture_live_once(
                 target,
@@ -968,11 +1028,28 @@ def capture_live(
                 output,
                 url_builder=url_builder,
                 timeout_ms=timeout_ms,
+                return_week=return_week,
+                day_output=day_output,
             )
         except Exception as exc:
             last_error = exc
-            if attempt >= 2 or not _is_retryable_capture_error(exc):
+            if attempt >= 1 or not _is_retryable_capture_error(exc):
                 raise
             time.sleep(0.25 * (2**attempt))
     assert last_error is not None
     raise last_error
+
+
+def capture_live_week(
+    target: date,
+    group: str,
+    output: Path,
+    *,
+    day_output: Path | None = None,
+    timeout_ms: int = 35_000,
+) -> tuple[dict[date, DaySchedule], datetime]:
+    """Capture one official page and return every parsed day plus its PNG."""
+    _day, checked_at, week = capture_live(
+        target, group, output, timeout_ms=timeout_ms, return_week=True, day_output=day_output
+    )
+    return week, checked_at

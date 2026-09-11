@@ -1,12 +1,12 @@
 import hashlib
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from ib261_schedule.cache import CacheStore
-from ib261_schedule.presentation import format_schedule
+from ib261_schedule.presentation import format_schedule, format_week_schedule
 from ib261_schedule.schedule import DaySchedule, Lesson
 from ib261_schedule.source import build_canonical_url, build_source_url
 
@@ -58,7 +58,7 @@ def test_format_schedule_includes_date_weekday_subgroups_source_and_check_time()
     checked = datetime(2026, 9, 8, 9, 1, tzinfo=MOSCOW)
     text = format_schedule(sample_schedule(), checked, stale=False)
     assert "8 сентября 2026" in text
-    assert "вторник" in text
+    assert "Вторник" in text
     assert "1 п/г" in text and "2 п/г" in text
     assert "Аудитория: 430/3" in text
     assert "Аудитория" not in text.split("2 п/г", 1)[1]
@@ -71,6 +71,16 @@ def test_format_stale_cache_is_unmistakably_marked():
         sample_schedule(), datetime(2026, 9, 7, 10, 0, tzinfo=MOSCOW), stale=True
     )
     assert text.startswith("⚠️ РАНЕЕ ПОЛУЧЕННЫЕ ДАННЫЕ")
+
+
+def test_week_format_has_calendar_span_and_all_day_headings():
+    monday = date(2026, 9, 7)
+    schedules = {monday + timedelta(days=i): DaySchedule(
+        "ИБ-261", monday + timedelta(days=i), "знаменатель", ()
+    ) for i in range(7)}
+    text = format_week_schedule(schedules, datetime(2026, 9, 11, 12, tzinfo=MOSCOW), parity="знаменатель")
+    assert "Расписание ИБ-261 на неделю с 7 по 13 сентября 2026" in text
+    assert "Понедельник" in text and "Воскресенье" in text
 
 
 def test_cache_commits_json_and_screenshot_as_one_snapshot(tmp_path: Path):
