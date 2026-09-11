@@ -9,7 +9,7 @@
   "week_number": null,
   "parity": "знаменатель",
   "empty_schedule_confirmed": false,
-  "checked_at": "2026-09-12T00:00:30.563500+03:00",
+  "checked_at": "2026-09-12T02:18:20.323355+03:00",
   "source_url": "https://cchgeu.ru/studentu/onlayn-raspisanie/",
   "lessons": [
     {
@@ -94,6 +94,6 @@
     }
   ],
   "verified": true,
-  "data_sha256": "04520069752e2259d8c75b72bcf3018df346a020b6558ad4d74c8af211629577",
+  "data_sha256": "1b2f32a3a100eb1f18c61c54b69725c511ecaabd699b5fef0bc9cf2d647accc7",
   "screenshot_sha256": "a8c37faf5f6f6234b044b60e962a9cbfbc8468f3fd3a922d032ee63e6da3d533"
 }
