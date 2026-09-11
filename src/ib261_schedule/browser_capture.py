@@ -886,6 +886,17 @@ def _capture_live_once(
                 fd, temporary_name = tempfile.mkstemp(prefix=".schedule-", suffix=".png", dir=output.parent)
                 os.close(fd)
                 temporary_output = Path(temporary_name)
+                if day_output is not None:
+                    # Make the complete official block fit the viewport before
+                    # deriving a clip.  Playwright clip coordinates are
+                    # viewport-relative; a tall schedule otherwise gets
+                    # clamped at the current 1200px viewport bottom.
+                    container_box = page.locator("#schedule-container").first.bounding_box()
+                    if container_box:
+                        page.set_viewport_size({
+                            "width": max(1400, int(container_box["width"])),
+                            "height": max(1200, int(container_box["height"] + 40)),
+                        })
                 page.locator("#schedule-container").first.screenshot(
                     path=str(temporary_output), animations="disabled"
                 )
@@ -918,10 +929,11 @@ def _capture_live_once(
                           const end = next === undefined ? rows.length : next;
                           const chosen = rows.slice(start, end).map(r => r.getBoundingClientRect()).filter(r => r.width && r.height);
                           const box = table.getBoundingClientRect();
+                          const rootBox = root.getBoundingClientRect();
                           if (!chosen.length || !box.width || !box.height) return null;
                           const top = Math.max(box.top, Math.min(...chosen.map(r => r.top)) - 4);
                           const bottom = Math.min(box.bottom, Math.max(...chosen.map(r => r.bottom)) + 4);
-                          return {x: box.left, y: top, width: box.width, height: bottom-top};
+                          return {x: box.left-rootBox.left, y: top-rootBox.top, width: box.width, height: bottom-top};
                         }""",
                         label,
                     )

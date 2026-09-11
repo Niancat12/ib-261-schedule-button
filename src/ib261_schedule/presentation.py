@@ -113,7 +113,7 @@ def format_week_schedule(
         if index:
             lines.append("\n" + "─" * 20)
         schedule = schedules[day]
-        lines.append(f"{day.day} {_MONTHS[day.month]} {day.year}, {_WEEKDAYS[day.weekday()]}")
+        lines.append(f"{day.day} {_MONTHS[day.month]} {day.year}, {_WEEKDAYS[day.weekday()].capitalize()}")
         if schedule.lessons:
             for lesson in schedule.lessons:
                 lines.extend(("", *_lesson_lines(lesson)))

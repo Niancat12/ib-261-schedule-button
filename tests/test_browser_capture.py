@@ -9,6 +9,7 @@ from playwright.sync_api import Locator
 
 import ib261_schedule.browser_capture as browser_capture
 from ib261_schedule.browser_capture import capture_live
+import struct
 
 HTML = """<!doctype html><html><head><meta charset='utf-8'><style>
 #schedule-container { width: 700px; background: white; color: black; padding: 10px; }
@@ -86,6 +87,30 @@ def test_capture_live_parses_and_screenshots_the_same_dom(tmp_path: Path):
     assert [lesson.subject for lesson in schedule.lessons] == ["Физика", "История России"]
     assert checked_at.tzinfo is not None
     assert output.is_file() and output.stat().st_size > 1000
+
+
+def test_capture_live_day_crop_uses_section_rows_and_is_shorter(tmp_path: Path):
+    html = HTML.replace("Сегодня 08.09.2026", "Сегодня 11.09.2026", 1).replace("Вт.", "Пт.", 1)
+    class FridayHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+        def log_message(self, *args):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FridayHandler)
+    thread = Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        full = tmp_path / "full.png"; day = tmp_path / "day.png"
+        capture_live(date(2026, 9, 11), "ИБ-261", full, day_output=day,
+                     url_builder=lambda *_: f"http://127.0.0.1:{server.server_port}/schedule")
+    finally:
+        server.shutdown(); thread.join()
+    full_height = struct.unpack(">II", full.read_bytes()[16:24])[1]
+    day_height = struct.unpack(">II", day.read_bytes()[16:24])[1]
+    assert day_height < full_height
+    assert day_height > 100
 
 
 def test_capture_live_uses_canonical_url_without_selecting_intermediate_groups(tmp_path: Path, monkeypatch):
