@@ -571,7 +571,9 @@ def register(ctx: Any) -> None:
         if _event_chat_id(event) != target_chat or str(platform_name).casefold() != "telegram":
             return None
         text = getattr(event, "text", "")
-        if text in {BUTTON, MENU_COMMAND, "Сегодня", "Завтра", "Неделя", "Обновить", "⬅️ Вчера", "➡️ Завтра", "📆 Другая дата", "📅 Другая дата", "/ib261"} or controller._awaiting_date.__contains__(_key(event)):
+        first_token = str(text).split(maxsplit=1)[0].casefold() if str(text).strip() else ""
+        is_schedule_command = first_token == "/schedule" or first_token.startswith("/schedule@")
+        if is_schedule_command or text in {BUTTON, MENU_COMMAND, "Сегодня", "Завтра", "Неделя", "Обновить", "⬅️ Вчера", "➡️ Завтра", "📆 Другая дата", "📅 Другая дата", "/ib261"} or controller._awaiting_date.__contains__(_key(event)):
             ctx.spawn_task(handle(event))
             return {"action": "skip", "reason": "ib261-button"}
         return None
